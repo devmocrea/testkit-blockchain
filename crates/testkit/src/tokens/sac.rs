@@ -15,29 +15,53 @@ const SAC_DECIMALS: u32 = 7;
 
 /// A deployed Stellar Asset Contract test double, with one-line mint/balance
 /// helpers so tests don't hand-roll SAC setup boilerplate.
+///
+/// # Environment binding
+///
+/// A `TestToken` is bound to the [`soroban_sdk::Env`] it was created from: it
+/// holds a cloned handle to that environment together with the SAC's contract
+/// address and the admin address that registered it. All three belong to the
+/// same host, so a fixture must never be used with a different environment.
+///
+/// [`TestEnv::reset`] replaces the underlying host with a fresh one. Values
+/// created before the reset — token fixtures, the [`Address`]es passed to
+/// them, and any `TokenClient` — stay attached to the *discarded* host. They
+/// do not become invalid and do not fail loudly: a stale token keeps reading
+/// and mutating the old state, so a test can silently assert against balances
+/// that no longer exist. Rebuild the fixture after a reset instead of
+/// carrying it across, and regenerate the addresses you pass to it. The same
+/// applies to the fresh environment produced by [`TestEnv::clone_config`].
+///
+/// Mixing values from two environments can fail: an `Address` created in one
+/// host may be an unknown object reference in another. Recreate every value
+/// you need from the environment you intend to keep using.
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::core::TestEnv;
+///
+/// let mut env = TestEnv::new();
+/// let stale = env.token();
+/// let stale_alice = env.address();
+/// stale.mint_raw(&stale_alice, 100);
+///
+/// env.reset();
+///
+/// // `stale` and `stale_alice` still refer to the discarded environment.
+/// // Rebuild the fixture and its addresses from the reset environment.
+/// let token = env.token();
+/// let alice = env.address();
+/// token.assert_balance(&alice, 0);
+/// token.mint_raw(&alice, 25);
+/// token.assert_balance(&alice, 25);
+/// ```
 pub struct TestToken {
     env: Env,
     address: Address,
     admin: Address,
     total_tracked: Cell<i128>,
 }
-impl<'a> SacFixture<'a> {
-    // ...existing constructors and methods stay as they are...
-
-    /// The admin address this fixture registered the token with.
-    ///
-    /// Use this when composing auth expectations, e.g. for `mint`,
-    /// `set_authorized`, or `set_admin`, which require the admin's auth.
-    pub fn admin(&self) -> &Address {
-        &self.admin
-    }
-
-    /// The admin address as an owned value, for APIs that take `Address` by value.
-    pub fn admin_address(&self) -> Address {
-        self.admin.clone()
-    }
-}
-
 impl TestToken {
     fn new(env: &Env, admin: Address) -> Self {
         let sac = env.register_stellar_asset_contract_v2(admin.clone());
@@ -176,48 +200,6 @@ impl TestToken {
         TokenClient::new(&self.env, &self.address).balance(of)
     }
 
-    use soroban_sdk::{token::TokenClient, Address, Env, String};
-
-/// Snapshot of what the token contract reports on-chain.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TokenMetadata {
-    pub name: String,
-    pub symbol: String,
-    pub decimals: u32,
-}
-
-impl SacDouble {
-    // NOTE: assumes the double holds `env: Env` and `address: Address`.
-    // Adapt field names to the real struct.
-
-    /// Read metadata from the contract as the SDK exposes it.
-    pub fn metadata(&self) -> TokenMetadata {
-        let client = TokenClient::new(&self.env, &self.address);
-        TokenMetadata {
-            name: client.name(),
-            symbol: client.symbol(),
-            decimals: client.decimals(),
-        }
-    }
-
-    /// Assert the full metadata snapshot.
-    pub fn assert_metadata(&self, expected: &TokenMetadata) {
-        assert_eq!(&self.metadata(), expected, "token metadata mismatch");
-    }
-
-    /// SAC decimals are fixed by the protocol.
-    pub fn assert_default_sac_decimals(&self) {
-        assert_eq!(self.metadata().decimals, 7);
-    }
-
-    /// Metadata must not change across an admin rotation.
-    pub fn assert_metadata_unchanged_by<F: FnOnce(&Self)>(&self, action: F) {
-        let before = self.metadata();
-        action(self);
-        assert_eq!(before, self.metadata(), "metadata changed unexpectedly");
-    }
-}
-
     /// Assert that `of`'s base-unit balance equals `expected`.
     ///
     /// # Panics
@@ -271,6 +253,12 @@ impl SacDouble {
 
 impl TestEnv {
     /// Deploy a Stellar Asset Contract with the standard 7 decimals.
+    ///
+    /// The returned [`TestToken`] is bound to this `TestEnv`'s current
+    /// environment. After [`TestEnv::reset`] (or on a
+    /// [`TestEnv::clone_config`] result), call `token()` again to get a
+    /// fixture attached to the new environment; see [`TestToken`] for the
+    /// full lifetime rules.
     ///
     /// # Example
     ///
@@ -349,6 +337,60 @@ mod tests {
 
         token.assert_balance(&alice, 70);
         token.assert_balance(&bob, 30);
+    }
+
+    #[test]
+    fn token_fixture_keeps_observing_the_discarded_env_after_reset() {
+        let mut env = TestEnv::new();
+        let stale = env.token();
+        let stale_alice = env.address();
+        stale.mint_raw(&stale_alice, 100);
+
+        env.reset();
+
+        // The old fixture and address still see the discarded host, silently.
+        stale.assert_balance(&stale_alice, 100);
+        assert_eq!(stale.total_tracked(), 100);
+
+        // A rebuilt fixture on the new host starts from zero balances.
+        let fresh = env.token();
+        let fresh_alice = env.address();
+        fresh.assert_balance(&fresh_alice, 0);
+        assert_eq!(fresh.total_tracked(), 0);
+    }
+
+    #[test]
+    fn rebuilt_token_fixture_is_usable_after_reset() {
+        let mut env = TestEnv::new();
+        let stale = env.token();
+        let stale_alice = env.address();
+        stale.mint_raw(&stale_alice, 5);
+
+        env.reset();
+
+        let token = env.token();
+        let alice = env.address();
+        token.mint_raw(&alice, 42);
+        token.assert_balance(&alice, 42);
+        assert_eq!(token.total_tracked(), 42);
+        // The stale fixture is unaffected by mints through the rebuilt one.
+        stale.assert_balance(&stale_alice, 5);
+        assert_eq!(stale.total_tracked(), 5);
+    }
+
+    #[test]
+    fn addresses_from_before_reset_cannot_be_used_with_a_rebuilt_token() {
+        let mut env = TestEnv::new();
+        let stale = env.token();
+        let stale_alice = env.address();
+        stale.mint_raw(&stale_alice, 100);
+        env.reset();
+
+        let token = env.token();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            token.balance(&stale_alice);
+        }));
+        assert!(result.is_err());
     }
 
     #[test]
