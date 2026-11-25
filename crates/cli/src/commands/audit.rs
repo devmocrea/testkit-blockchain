@@ -91,7 +91,7 @@ pub struct AuditArgs {
 pub enum Rule {
     /// An entry point's Address parameter that is never checked with require_auth
     MissingRequireAuth,
-    /// Raw `+ - * /` on an i128 value
+    /// Raw arithmetic (`+ - * / %`, negation, compound assignment, or raw method forms) on an i128 value
     UncheckedI128Arithmetic,
     /// A persistent/temporary storage read with no extend_ttl
     MissingTtlBump,
@@ -882,21 +882,22 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
         }
         let whole = Expr::Binary(node.clone());
         if self.arithmetic_touches_i128(&whole) {
-            self.findings.push(Finding {
-                file: self.path.clone(),
-                line: line_of(node.op),
-                rule: Rule::UncheckedI128Arithmetic.id(),
-                severity: "warning",
-                message: format!(
-                    "fn {} does raw arithmetic on an i128 value; prefer checked_/saturating_/ \
-                     wrapping_ variants to avoid silent overflow",
-                    self.fn_name
-                ),
-            });
+            self.push_arithmetic_finding(line_of(node.op));
         }
         // The arithmetic operators of this expression are covered by the
         // check above; only its non-arithmetic operands may hold separate
         // expressions (calls, blocks, closures) that need their own check.
+        self.visit_arithmetic_operands(&whole);
+    }
+
+    fn visit_expr_unary(&mut self, node: &'ast syn::ExprUnary) {
+        if !matches!(node.op, syn::UnOp::Neg(_)) || is_int_literal(&node.expr) {
+            return visit::visit_expr_unary(self, node);
+        }
+        let whole = Expr::Unary(node.clone());
+        if self.arithmetic_touches_i128(&whole) {
+            self.push_arithmetic_finding(line_of(node.op));
+        }
         self.visit_arithmetic_operands(&whole);
     }
 }
@@ -904,18 +905,55 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
 fn is_arithmetic(op: &BinOp) -> bool {
     matches!(
         op,
-        BinOp::Add(_) | BinOp::Sub(_) | BinOp::Mul(_) | BinOp::Div(_)
+        BinOp::Add(_)
+            | BinOp::Sub(_)
+            | BinOp::Mul(_)
+            | BinOp::Div(_)
+            | BinOp::Rem(_)
+            | BinOp::AddAssign(_)
+            | BinOp::SubAssign(_)
+            | BinOp::MulAssign(_)
+            | BinOp::DivAssign(_)
+            | BinOp::RemAssign(_)
     )
 }
 
+fn is_int_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Lit(lit) => matches!(lit.lit, syn::Lit::Int(_)),
+        Expr::Paren(p) => is_int_literal(&p.expr),
+        Expr::Group(g) => is_int_literal(&g.expr),
+        _ => false,
+    }
+}
+
 impl I128ArithmeticVisitor<'_> {
+    fn push_arithmetic_finding(&mut self, line: usize) {
+        self.findings.push(Finding {
+            file: self.path.clone(),
+            line,
+            rule: Rule::UncheckedI128Arithmetic.id(),
+            severity: "warning",
+            message: format!(
+                "fn {} does raw arithmetic on an i128 value; prefer checked_/saturating_/ \
+                 wrapping_ variants to avoid silent overflow",
+                self.fn_name
+            ),
+        });
+    }
+
     /// Whether any operand anywhere in this arithmetic expression (looking
-    /// through nested `+ - * /` and parentheses) is an i128 value.
+    /// through nested arithmetic operators and parentheses) is an i128 value.
     fn arithmetic_touches_i128(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Binary(binary) if is_arithmetic(&binary.op) => {
                 self.arithmetic_touches_i128(&binary.left)
                     || self.arithmetic_touches_i128(&binary.right)
+            }
+            Expr::Unary(unary)
+                if matches!(unary.op, syn::UnOp::Neg(_)) && !is_int_literal(&unary.expr) =>
+            {
+                self.arithmetic_touches_i128(&unary.expr)
             }
             Expr::Paren(p) => self.arithmetic_touches_i128(&p.expr),
             Expr::Group(g) => self.arithmetic_touches_i128(&g.expr),
@@ -931,6 +969,11 @@ impl I128ArithmeticVisitor<'_> {
                 self.visit_arithmetic_operands(&binary.left);
                 self.visit_arithmetic_operands(&binary.right);
             }
+            Expr::Unary(unary)
+                if matches!(unary.op, syn::UnOp::Neg(_)) && !is_int_literal(&unary.expr) =>
+            {
+                self.visit_arithmetic_operands(&unary.expr);
+            }
             Expr::Paren(p) => self.visit_arithmetic_operands(&p.expr),
             Expr::Group(g) => self.visit_arithmetic_operands(&g.expr),
             other => self.visit_expr(other),
@@ -944,6 +987,10 @@ impl I128ArithmeticVisitor<'_> {
                 .get_ident()
                 .is_some_and(|ident| self.i128_bindings.contains(&ident.to_string())),
             Expr::Lit(lit) => matches!(&lit.lit, syn::Lit::Int(i) if i.suffix() == "i128"),
+            Expr::Reference(r) => self.touches_i128(&r.expr),
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_) | syn::UnOp::Neg(_)) => {
+                self.touches_i128(&u.expr)
+            }
             Expr::Paren(p) => self.touches_i128(&p.expr),
             Expr::Group(g) => self.touches_i128(&g.expr),
             _ => false,
@@ -1605,6 +1652,55 @@ impl Vault {
         assert!(
             json.ends_with(",\"finding_count\":0,\"findings\":[]}"),
             "{json}"
+        );
+    }
+
+    #[test]
+    fn i128_remainder_negation_and_compound_assignments_are_flagged() {
+        let src = r#"
+fn ops(mut a: i128, b: i128) -> i128 {
+    let rem = a % b;
+    let neg = -a;
+    a += b;
+    a -= 1;
+    a *= 2;
+    a /= 3;
+    a %= 5;
+    let lit_neg = -1i128;
+    lit_neg
+}
+"#;
+        assert_eq!(
+            rules_of(src, &[Rule::UncheckedI128Arithmetic]),
+            vec![
+                ("unchecked-i128-arithmetic", 3),
+                ("unchecked-i128-arithmetic", 4),
+                ("unchecked-i128-arithmetic", 5),
+                ("unchecked-i128-arithmetic", 6),
+                ("unchecked-i128-arithmetic", 7),
+                ("unchecked-i128-arithmetic", 8),
+                ("unchecked-i128-arithmetic", 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_i128_remainder_negation_and_compound_assignments_are_not_flagged() {
+        let src = r#"
+fn safe_u64(mut a: u64, b: u64, mut c: i64) -> i64 {
+    let r = a % b;
+    a += b;
+    a -= 1;
+    a *= 2;
+    a /= 3;
+    a %= 5;
+    c = -c;
+    c
+}
+"#;
+        assert_eq!(
+            rules_of(src, &[Rule::UncheckedI128Arithmetic]),
+            Vec::<(&'static str, usize)>::new()
         );
     }
 }
