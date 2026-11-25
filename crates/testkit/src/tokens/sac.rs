@@ -191,8 +191,9 @@ impl TestToken {
     ///
     /// # Panics
     ///
-    /// Panics with a [`TestkitError::AssertionFailed`] showing the expected
-    /// and actual balances if they differ.
+    /// Panics with a [`TestkitError::AssertionFailed`] showing the token
+    /// address, recipient address, and expected and actual balances if they
+    /// differ.
     ///
     /// # Example
     ///
@@ -212,7 +213,8 @@ impl TestToken {
             panic!(
                 "{}",
                 TestkitError::AssertionFailed(format!(
-                    "expected balance of {of:?} to be {expected}, found {actual}"
+                    "expected balance of {of:?} on token {:?} to be {expected}, found {actual}",
+                    self.address
                 ))
             );
         }
@@ -515,5 +517,32 @@ mod tests {
         wallet.allow(&token.address(), &alice, &spender, &50, &1_000);
         let allowance = TokenClient::new(env.env(), &token.address()).allowance(&alice, &spender);
         assert_eq!(allowance, 50);
+    }
+
+    #[test]
+    fn assert_balance_failure_includes_token_and_recipient_context() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        token.mint_raw(&alice, 42);
+
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            token.assert_balance(&alice, 100);
+        }))
+        .expect_err("expected assert_balance to panic on mismatch");
+
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .expect("panic payload should be a string");
+
+        assert_eq!(
+            msg,
+            format!(
+                "assertion failed: expected balance of {alice:?} on token {:?} to be 100, found 42",
+                token.address()
+            )
+        );
     }
 }
