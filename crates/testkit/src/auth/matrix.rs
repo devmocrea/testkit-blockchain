@@ -6,6 +6,7 @@ use crate::core::{TestEnv, TestkitError};
 
 type InvokeFn<'a> = Box<dyn Fn(&Address) -> Result<(), soroban_sdk::Error> + 'a>;
 
+/// Errors raised while building or evaluating an [`AuthMatrix`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatrixError {
     /// Two or more entries share the same name.

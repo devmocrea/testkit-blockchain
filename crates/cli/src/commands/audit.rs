@@ -346,7 +346,7 @@ struct Finding {
 /// A finding's line is the line of its function's `fn` keyword, or of the
 /// operator for arithmetic, so a doc comment or attribute above a function
 /// never moves the reported line.
-pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
+pub fn run(args: AuditArgs, out: Output) -> Result<AuditStatus, CliError> {
     let rules =
         selected_rules(&args.rules, &args.exclude_rules).unwrap_or_else(|msg| usage_error(msg));
     let all_rules = rules.len() == Rule::ALL.len();

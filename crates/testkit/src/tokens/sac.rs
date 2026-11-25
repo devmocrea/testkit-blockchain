@@ -15,29 +15,40 @@ const SAC_DECIMALS: u32 = 7;
 
 /// A deployed Stellar Asset Contract test double, with one-line mint/balance
 /// helpers so tests don't hand-roll SAC setup boilerplate.
+///
+/// # Multiple tokens in one environment
+///
+/// Every call to [`TestEnv::token`] deploys a separate SAC backed by a
+/// different randomly-generated asset, with its own contract address and
+/// admin. Fixtures never share a balance ledger: the same [`Address`] can
+/// hold a different balance in each token, and [`TestToken::total_tracked`]
+/// counts only the mints made through that particular fixture.
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::core::TestEnv;
+///
+/// let env = TestEnv::new();
+/// let first = env.token();
+/// let second = env.token();
+/// let alice = env.address();
+///
+/// assert_ne!(first.address(), second.address());
+/// first.mint_raw(&alice, 100);
+/// second.mint_raw(&alice, 7);
+///
+/// first.assert_balance(&alice, 100);
+/// second.assert_balance(&alice, 7);
+/// assert_eq!(first.total_tracked(), 100);
+/// assert_eq!(second.total_tracked(), 7);
+/// ```
 pub struct TestToken {
     env: Env,
     address: Address,
     admin: Address,
     total_tracked: Cell<i128>,
 }
-impl<'a> SacFixture<'a> {
-    // ...existing constructors and methods stay as they are...
-
-    /// The admin address this fixture registered the token with.
-    ///
-    /// Use this when composing auth expectations, e.g. for `mint`,
-    /// `set_authorized`, or `set_admin`, which require the admin's auth.
-    pub fn admin(&self) -> &Address {
-        &self.admin
-    }
-
-    /// The admin address as an owned value, for APIs that take `Address` by value.
-    pub fn admin_address(&self) -> Address {
-        self.admin.clone()
-    }
-}
-
 impl TestToken {
     fn new(env: &Env, admin: Address) -> Self {
         let sac = env.register_stellar_asset_contract_v2(admin.clone());
@@ -176,48 +187,6 @@ impl TestToken {
         TokenClient::new(&self.env, &self.address).balance(of)
     }
 
-    use soroban_sdk::{token::TokenClient, Address, Env, String};
-
-/// Snapshot of what the token contract reports on-chain.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TokenMetadata {
-    pub name: String,
-    pub symbol: String,
-    pub decimals: u32,
-}
-
-impl SacDouble {
-    // NOTE: assumes the double holds `env: Env` and `address: Address`.
-    // Adapt field names to the real struct.
-
-    /// Read metadata from the contract as the SDK exposes it.
-    pub fn metadata(&self) -> TokenMetadata {
-        let client = TokenClient::new(&self.env, &self.address);
-        TokenMetadata {
-            name: client.name(),
-            symbol: client.symbol(),
-            decimals: client.decimals(),
-        }
-    }
-
-    /// Assert the full metadata snapshot.
-    pub fn assert_metadata(&self, expected: &TokenMetadata) {
-        assert_eq!(&self.metadata(), expected, "token metadata mismatch");
-    }
-
-    /// SAC decimals are fixed by the protocol.
-    pub fn assert_default_sac_decimals(&self) {
-        assert_eq!(self.metadata().decimals, 7);
-    }
-
-    /// Metadata must not change across an admin rotation.
-    pub fn assert_metadata_unchanged_by<F: FnOnce(&Self)>(&self, action: F) {
-        let before = self.metadata();
-        action(self);
-        assert_eq!(before, self.metadata(), "metadata changed unexpectedly");
-    }
-}
-
     /// Assert that `of`'s base-unit balance equals `expected`.
     ///
     /// # Panics
@@ -271,6 +240,10 @@ impl SacDouble {
 
 impl TestEnv {
     /// Deploy a Stellar Asset Contract with the standard 7 decimals.
+    ///
+    /// Each call deploys a fresh, independent SAC with its own contract
+    /// address, admin, and balance ledger; see [`TestToken`] for the
+    /// multi-token guarantees.
     ///
     /// # Example
     ///
@@ -349,6 +322,88 @@ mod tests {
 
         token.assert_balance(&alice, 70);
         token.assert_balance(&bob, 30);
+    }
+
+    #[test]
+    fn two_tokens_in_one_environment_have_distinct_addresses() {
+        let env = TestEnv::new();
+        let first = env.token();
+        let second = env.token();
+        assert_ne!(first.address(), second.address());
+    }
+
+    #[test]
+    fn the_same_address_has_independent_balances_in_each_token() {
+        let env = TestEnv::new();
+        let first = env.token();
+        let second = env.token();
+        let alice = env.address();
+
+        first.mint_raw(&alice, 100);
+        second.mint_raw(&alice, 7);
+
+        first.assert_balance(&alice, 100);
+        second.assert_balance(&alice, 7);
+    }
+
+    #[test]
+    fn minting_into_one_token_does_not_affect_another_recipient() {
+        let env = TestEnv::new();
+        let first = env.token();
+        let second = env.token();
+        let alice = env.address();
+        let bob = env.address();
+
+        first.mint_raw(&alice, 100);
+        second.mint_raw(&bob, 5);
+
+        first.assert_balance(&alice, 100);
+        first.assert_balance(&bob, 0);
+        second.assert_balance(&alice, 0);
+        second.assert_balance(&bob, 5);
+    }
+
+    #[test]
+    fn total_tracked_is_counted_per_fixture() {
+        let env = TestEnv::new();
+        let first = env.token();
+        let second = env.token();
+        let alice = env.address();
+
+        first.mint_raw(&alice, 100);
+        first.mint(&alice, 1);
+        second.mint_raw(&alice, 7);
+
+        assert_eq!(first.total_tracked(), 100 + 10i128.pow(7));
+        assert_eq!(second.total_tracked(), 7);
+    }
+
+    #[test]
+    fn a_transfer_in_one_token_leaves_the_other_token_untouched() {
+        let env = TestEnv::new();
+        let first = env.token();
+        let second = env.token();
+        let alice = env.address();
+        let bob = env.address();
+        first.mint_raw(&alice, 100);
+        second.mint_raw(&alice, 100);
+
+        TokenClient::new(env.env(), &first.address())
+            .mock_auths(&[MockAuth {
+                address: &alice,
+                invoke: &MockAuthInvoke {
+                    contract: &first.address(),
+                    fn_name: "transfer",
+                    args: (alice.clone(), bob.clone(), 30_i128).into_val(env.env()),
+                    sub_invokes: &[],
+                },
+            }])
+            .transfer(&alice, soroban_sdk::MuxedAddress::from(bob.clone()), &30);
+
+        first.assert_balance(&alice, 70);
+        first.assert_balance(&bob, 30);
+        second.assert_balance(&alice, 100);
+        second.assert_balance(&bob, 0);
     }
 
     #[test]
