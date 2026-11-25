@@ -1,8 +1,10 @@
+use std::borrow::Borrow;
 use std::cell::Cell;
 
 use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
-use soroban_sdk::{Address, Env, IntoVal};
+use soroban_sdk::xdr::{ScErrorCode, ScErrorType};
+use soroban_sdk::{Address, Env, Error, IntoVal, InvokeError};
 
 use crate::core::{TestEnv, TestkitError};
 
@@ -13,6 +15,26 @@ use crate::core::{TestEnv, TestkitError};
 /// freshly deployed SAC's own `decimals()` always returns 7.
 const SAC_DECIMALS: u32 = 7;
 
+/// SAC `ContractError::BalanceError` code, returned when a transfer would
+/// take the sender's balance below zero.
+const SAC_BALANCE_ERROR_CODE: u32 = 10;
+
+/// The SDK surfaces a failed `Address::require_auth` on a SAC transfer as a
+/// host context error rather than a contract error.
+fn sac_missing_auth_error() -> Error {
+    Error::from_type_and_code(ScErrorType::Context, ScErrorCode::InvalidAction)
+}
+
+type TransferResult = Result<(), Result<Error, InvokeError>>;
+
+fn describe_transfer_result(result: &TransferResult) -> String {
+    match result {
+        Ok(()) => "the transfer succeeded".to_owned(),
+        Err(Ok(error)) => format!("the transfer failed with {error:?}"),
+        Err(Err(invoke_error)) => format!("the invocation failed with {invoke_error:?}"),
+    }
+}
+
 /// A deployed Stellar Asset Contract test double, with one-line mint/balance
 /// helpers so tests don't hand-roll SAC setup boilerplate.
 pub struct TestToken {
@@ -21,23 +43,6 @@ pub struct TestToken {
     admin: Address,
     total_tracked: Cell<i128>,
 }
-impl<'a> SacFixture<'a> {
-    // ...existing constructors and methods stay as they are...
-
-    /// The admin address this fixture registered the token with.
-    ///
-    /// Use this when composing auth expectations, e.g. for `mint`,
-    /// `set_authorized`, or `set_admin`, which require the admin's auth.
-    pub fn admin(&self) -> &Address {
-        &self.admin
-    }
-
-    /// The admin address as an owned value, for APIs that take `Address` by value.
-    pub fn admin_address(&self) -> Address {
-        self.admin.clone()
-    }
-}
-
 impl TestToken {
     fn new(env: &Env, admin: Address) -> Self {
         let sac = env.register_stellar_asset_contract_v2(admin.clone());
@@ -176,48 +181,6 @@ impl TestToken {
         TokenClient::new(&self.env, &self.address).balance(of)
     }
 
-    use soroban_sdk::{token::TokenClient, Address, Env, String};
-
-/// Snapshot of what the token contract reports on-chain.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TokenMetadata {
-    pub name: String,
-    pub symbol: String,
-    pub decimals: u32,
-}
-
-impl SacDouble {
-    // NOTE: assumes the double holds `env: Env` and `address: Address`.
-    // Adapt field names to the real struct.
-
-    /// Read metadata from the contract as the SDK exposes it.
-    pub fn metadata(&self) -> TokenMetadata {
-        let client = TokenClient::new(&self.env, &self.address);
-        TokenMetadata {
-            name: client.name(),
-            symbol: client.symbol(),
-            decimals: client.decimals(),
-        }
-    }
-
-    /// Assert the full metadata snapshot.
-    pub fn assert_metadata(&self, expected: &TokenMetadata) {
-        assert_eq!(&self.metadata(), expected, "token metadata mismatch");
-    }
-
-    /// SAC decimals are fixed by the protocol.
-    pub fn assert_default_sac_decimals(&self) {
-        assert_eq!(self.metadata().decimals, 7);
-    }
-
-    /// Metadata must not change across an admin rotation.
-    pub fn assert_metadata_unchanged_by<F: FnOnce(&Self)>(&self, action: F) {
-        let before = self.metadata();
-        action(self);
-        assert_eq!(before, self.metadata(), "metadata changed unexpectedly");
-    }
-}
-
     /// Assert that `of`'s base-unit balance equals `expected`.
     ///
     /// # Panics
@@ -247,6 +210,172 @@ impl SacDouble {
                 ))
             );
         }
+    }
+
+    fn try_transfer(
+        &self,
+        from: &Address,
+        to: &Address,
+        amount: i128,
+        authorize_from: bool,
+    ) -> TransferResult {
+        let client = TokenClient::new(&self.env, &self.address);
+        let result = if authorize_from {
+            client
+                .mock_auths(&[MockAuth {
+                    address: from,
+                    invoke: &MockAuthInvoke {
+                        contract: &self.address,
+                        fn_name: "transfer",
+                        args: (from.clone(), to.clone(), amount).into_val(&self.env),
+                        sub_invokes: &[],
+                    },
+                }])
+                .try_transfer(from, soroban_sdk::MuxedAddress::from(to.clone()), &amount)
+        } else {
+            client.try_transfer(from, soroban_sdk::MuxedAddress::from(to.clone()), &amount)
+        };
+        result.map(|converted| converted.expect("a SAC transfer returns no value to convert"))
+    }
+
+    /// Assert that a transfer fails with the SAC's insufficient-balance
+    /// error, `Error(Contract, #10)` (`ContractError::BalanceError`).
+    ///
+    /// This helper mocks `from`'s authorization for the single call so the
+    /// failure comes from the balance check, not from a missing signature.
+    /// Use [`TestToken::assert_transfer_fails_with_unauthorized`] for the
+    /// missing-signature case. Amounts are base units, as with
+    /// [`TestToken::balance`]; no whole-unit conversion is performed.
+    ///
+    /// # Panics
+    ///
+    /// Panics with [`TestkitError::AssertionFailed`] if the transfer succeeds
+    /// or returns any error other than the insufficient-balance error.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    /// let bob = env.address();
+    /// token.mint_raw(&alice, 10);
+    ///
+    /// token.assert_transfer_fails_with_insufficient_balance(&alice, &bob, 11);
+    /// token.assert_balance(&alice, 10); // the failed transfer changed nothing
+    /// token.assert_balance(&bob, 0);
+    /// ```
+    pub fn assert_transfer_fails_with_insufficient_balance(
+        &self,
+        from: impl Borrow<Address>,
+        to: impl Borrow<Address>,
+        amount: i128,
+    ) {
+        let result = self.try_transfer(from.borrow(), to.borrow(), amount, true);
+        let expected = Error::from_contract_error(SAC_BALANCE_ERROR_CODE);
+        if !matches!(&result, Err(Ok(error)) if *error == expected) {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected transfer of {amount} from {:?} to {:?} to fail with SAC \
+                     insufficient-balance error {expected:?}, but {}",
+                    from.borrow(),
+                    to.borrow(),
+                    describe_transfer_result(&result)
+                ))
+            );
+        }
+    }
+
+    /// Assert that a transfer fails because `from` did not authorize it.
+    ///
+    /// The call is made without any mocked authorization, so the SDK reports
+    /// the failing `require_auth` as `Error(Context, InvalidAction)`. This is
+    /// the SDK's representation of an unauthorized SAC transfer; it is not
+    /// the SAC's contract error #4. Amounts are base units.
+    ///
+    /// # Panics
+    ///
+    /// Panics with [`TestkitError::AssertionFailed`] if the transfer succeeds
+    /// or returns any error other than the missing-authorization error.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let token = env.token();
+    /// let alice = env.address();
+    /// let bob = env.address();
+    /// token.mint_raw(&alice, 10);
+    ///
+    /// token.assert_transfer_fails_with_unauthorized(&alice, &bob, 1);
+    /// token.assert_balance(&alice, 10);
+    /// token.assert_balance(&bob, 0);
+    /// ```
+    pub fn assert_transfer_fails_with_unauthorized(
+        &self,
+        from: impl Borrow<Address>,
+        to: impl Borrow<Address>,
+        amount: i128,
+    ) {
+        let result = self.try_transfer(from.borrow(), to.borrow(), amount, false);
+        let expected = sac_missing_auth_error();
+        if !matches!(&result, Err(Ok(error)) if *error == expected) {
+            panic!(
+                "{}",
+                TestkitError::AssertionFailed(format!(
+                    "expected transfer of {amount} from {:?} to {:?} to fail with \
+                     missing-authorization error {expected:?}, but {}",
+                    from.borrow(),
+                    to.borrow(),
+                    describe_transfer_result(&result)
+                ))
+            );
+        }
+    }
+
+    /// Alias for [`TestToken::assert_transfer_fails_with_insufficient_balance`].
+    pub fn assert_transfer_insufficient_balance(
+        &self,
+        from: impl Borrow<Address>,
+        to: impl Borrow<Address>,
+        amount: i128,
+    ) {
+        self.assert_transfer_fails_with_insufficient_balance(from, to, amount);
+    }
+
+    /// Alias for [`TestToken::assert_transfer_fails_with_unauthorized`].
+    pub fn assert_transfer_unauthorized(
+        &self,
+        from: impl Borrow<Address>,
+        to: impl Borrow<Address>,
+        amount: i128,
+    ) {
+        self.assert_transfer_fails_with_unauthorized(from, to, amount);
+    }
+
+    /// Alias for [`TestToken::assert_transfer_fails_with_insufficient_balance`].
+    pub fn assert_insufficient_balance_transfer(
+        &self,
+        from: impl Borrow<Address>,
+        to: impl Borrow<Address>,
+        amount: i128,
+    ) {
+        self.assert_transfer_fails_with_insufficient_balance(from, to, amount);
+    }
+
+    /// Alias for [`TestToken::assert_transfer_fails_with_unauthorized`].
+    pub fn assert_unauthorized_transfer(
+        &self,
+        from: impl Borrow<Address>,
+        to: impl Borrow<Address>,
+        amount: i128,
+    ) {
+        self.assert_transfer_fails_with_unauthorized(from, to, amount);
     }
 
     /// Total base units minted through this `TestToken` (via
@@ -325,6 +454,7 @@ impl TestEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::assert_panics_with_code;
     use soroban_sdk::{contract, contractimpl};
 
     #[test]
@@ -349,6 +479,90 @@ mod tests {
 
         token.assert_balance(&alice, 70);
         token.assert_balance(&bob, 30);
+    }
+
+    #[test]
+    fn insufficient_balance_helper_matches_the_sac_error_and_leaves_balances_unchanged() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+        token.mint_raw(&alice, 10);
+
+        token.assert_transfer_fails_with_insufficient_balance(&alice, &bob, 11);
+        token.assert_balance(&alice, 10);
+        token.assert_balance(&bob, 0);
+    }
+
+    #[test]
+    fn insufficient_balance_helper_handles_a_zero_balance() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+
+        token.assert_transfer_fails_with_insufficient_balance(&alice, &bob, 1);
+        token.assert_balance(&alice, 0);
+        token.assert_balance(&bob, 0);
+    }
+
+    #[test]
+    fn unauthorized_helper_matches_the_missing_auth_error_and_leaves_balances_unchanged() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+        token.mint_raw(&alice, 10);
+
+        token.assert_transfer_fails_with_unauthorized(&alice, &bob, 1);
+        token.assert_balance(&alice, 10);
+        token.assert_balance(&bob, 0);
+    }
+
+    #[test]
+    fn unauthorized_helper_rejects_a_transfer_that_would_succeed() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+        token.mint_raw(&alice, 10);
+        env.env().mock_all_auths();
+
+        let message = assert_panics_with_code("TESTKIT_ASSERTION_FAILED", || {
+            token.assert_transfer_fails_with_unauthorized(&alice, &bob, 1);
+        });
+        assert!(message.contains("the transfer succeeded"), "{message}");
+        token.assert_balance(&alice, 9);
+        token.assert_balance(&bob, 1);
+    }
+
+    #[test]
+    fn insufficient_balance_helper_rejects_a_different_contract_error() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+
+        // A negative amount is rejected with NegativeAmountError (#8), not
+        // BalanceError (#10), so the helper must not accept it.
+        let message = assert_panics_with_code("TESTKIT_ASSERTION_FAILED", || {
+            token.assert_transfer_fails_with_insufficient_balance(&alice, &bob, -1);
+        });
+        assert!(message.contains("Error(Contract, #8)"), "{message}");
+    }
+
+    #[test]
+    fn transfer_failure_helper_aliases_delegate_to_the_primaries() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let bob = env.address();
+        token.mint_raw(&alice, 10);
+
+        token.assert_transfer_insufficient_balance(&alice, &bob, 11);
+        token.assert_insufficient_balance_transfer(&alice, &bob, 11);
+        token.assert_transfer_unauthorized(&alice, &bob, 1);
+        token.assert_unauthorized_transfer(&alice, &bob, 1);
     }
 
     #[test]
