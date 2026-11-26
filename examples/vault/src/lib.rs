@@ -169,6 +169,54 @@ impl Vault {
         env.storage().temporary().get(&DataKey::Temp).unwrap_or(0)
     }
 
+    /// Deliberately buggy: reads the temporary entry without extending its
+    /// TTL, so the entry silently expires without the contract noticing.
+    /// Used to demonstrate that [`TestEnv::assert_bumps_ttl`] catches a
+    /// missing `extend_ttl` call on [`StorageKind::Temporary`] storage.
+    pub fn touch_temp(env: Env) -> i128 {
+        env.storage()
+            .temporary()
+            .get(&DataKey::Temp)
+            .unwrap_or(0)
+    }
+
+    /// The fixed version: extends the TTL on every read, keeping the
+    /// temporary entry alive for as long as it's actively used.
+    pub fn touch_temp_checked(env: Env) -> i128 {
+        let value = env
+            .storage()
+            .temporary()
+            .get(&DataKey::Temp)
+            .unwrap_or(0);
+        env.storage()
+            .temporary()
+            .extend_ttl(&DataKey::Temp, 5_000, 10_000);
+        value
+    }
+
+    /// Reads the instance balance without bumping the instance TTL.
+    /// Deliberately buggy: the instance entry can expire even under active
+    /// use. Used to demonstrate that [`TestEnv::assert_bumps_ttl`] catches
+    /// a missing `extend_ttl` call on [`StorageKind::Instance`] storage.
+    pub fn touch_instance(env: Env) -> Result<i128, VaultError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Balance)
+            .ok_or(VaultError::NotInitialized)
+    }
+
+    /// The fixed version: extends the instance TTL on every read so the
+    /// contract's own storage stays alive for as long as it's being called.
+    pub fn touch_instance_checked(env: Env) -> Result<i128, VaultError> {
+        let balance = env
+            .storage()
+            .instance()
+            .get(&DataKey::Balance)
+            .ok_or(VaultError::NotInitialized)?;
+        env.storage().instance().extend_ttl(5_000, 10_000);
+        Ok(balance)
+    }
+
     /// Pays `amount` to every address in `recipients`. Used by
     /// `soroban-testkit limits` to demonstrate ramping a batch operation's
     /// recipient count until it exceeds mainnet resource limits.
@@ -177,5 +225,35 @@ impl Vault {
             env.storage().persistent().set(&recipient, &amount);
         }
         recipients.len()
+    }
+
+    /// Deliberately buggy restoration path: attempts to read the persistent
+    /// record without first checking whether it still exists. When called after
+    /// the record has expired and been archived, the unconditional `unwrap`
+    /// panics. Used to demonstrate that
+    /// [`TestEnv::assert_restores_expired_persistent`] catches missing-restore
+    /// handling.
+    pub fn restore_record_broken(env: Env) -> i128 {
+        // BUG: reads without checking — panics if the entry has expired.
+        env.storage()
+            .persistent()
+            .get(&DataKey::Record)
+            .unwrap()
+    }
+
+    /// The correct restoration path: if the persistent record is absent (it
+    /// has expired and been archived), it is re-initialized to `0` so the
+    /// contract stays functional. Used to demonstrate that
+    /// [`TestEnv::assert_restores_expired_persistent`] passes when the
+    /// contract handles the missing-entry case.
+    pub fn restore_record_checked(env: Env) -> i128 {
+        if !env.storage().persistent().has(&DataKey::Record) {
+            // Entry was archived: restore by re-writing the initial value.
+            env.storage().persistent().set(&DataKey::Record, &0i128);
+        }
+        env.storage()
+            .persistent()
+            .get(&DataKey::Record)
+            .unwrap_or(0)
     }
 }

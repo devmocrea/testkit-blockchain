@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -324,15 +324,19 @@ struct Finding {
 /// capable of missing real bugs or flagging non-bugs. The absence of a
 /// finding here is never a security guarantee.
 ///
-/// 1. Contract entry points taking an `Address` parameter that never call
-///    `require_auth` anywhere in the function body. An entry point is a
-///    `pub fn` in an `impl` block marked `#[contractimpl]`, or any fn of a
-///    `#[contractimpl]` trait impl; free functions and helper `impl`s are
-///    not entry points (see [`EntryPoints`]).
-/// 2. Arithmetic (`+ - * /`) on an explicitly `i128`-typed binding, done
-///    outside a `checked_`/`saturating_`/`wrapping_` call. The finding points
-///    at the operator's line, so multiline expressions identify the exact
-///    arithmetic source location.
+/// 1. Contract entry points taking an `Address` parameter (including references,
+///    fully qualified paths like `soroban_sdk::Address`, and type or import
+///    aliases) that never call `require_auth` anywhere in the function body or
+///    in delegated helper functions. An entry point is a `pub fn` in an `impl`
+///    block marked `#[contractimpl]`, or any fn of a `#[contractimpl]` trait
+///    impl; free functions and helper `impl`s are not entry points (see
+///    [`EntryPoints`]). Intentional open entry points can suppress this rule
+///    with `#[allow(soroban_testkit::missing_require_auth)]` (or
+///    `#[allow(missing_require_auth)]`).
+/// 2. Arithmetic (`+ - * /`) on an `i128`-typed binding (following references
+///    and simple aliases), done outside a `checked_`/`saturating_`/`wrapping_`
+///    call. The finding points at the operator's line, so multiline expressions
+///    identify the exact arithmetic source location.
 /// 3. A `.persistent()`/`.temporary()` storage read with no
 ///    `.extend_ttl(` call anywhere in the same function.
 ///
@@ -685,13 +689,105 @@ fn audit_source(
         }
     };
 
+    let mut helpers = HashMap::new();
+    let mut address_aliases = HashSet::new();
+    let mut i128_aliases = HashSet::new();
+    collect_file_items(&file, &mut helpers, &mut address_aliases, &mut i128_aliases);
+
     let mut visitor = FunctionVisitor {
         path: display.to_string(),
         rules,
         findings,
         contract_impl: None,
+        contract_impl_suppressed: false,
+        helpers: &helpers,
+        address_aliases: &address_aliases,
+        i128_aliases: &i128_aliases,
     };
     visitor.visit_file(&file);
+}
+
+fn collect_file_items<'a>(
+    file: &'a syn::File,
+    helpers: &mut HashMap<String, Vec<&'a syn::Block>>,
+    address_aliases: &mut HashSet<String>,
+    i128_aliases: &mut HashSet<String>,
+) {
+    for item in &file.items {
+        match item {
+            Item::Fn(f) => {
+                helpers
+                    .entry(f.sig.ident.to_string())
+                    .or_default()
+                    .push(&f.block);
+            }
+            Item::Impl(i) => {
+                for impl_item in &i.items {
+                    if let syn::ImplItem::Fn(f) = impl_item {
+                        helpers
+                            .entry(f.sig.ident.to_string())
+                            .or_default()
+                            .push(&f.block);
+                    }
+                }
+            }
+            Item::Use(u) => {
+                collect_use_tree(&u.tree, false, address_aliases, i128_aliases);
+            }
+            _ => {}
+        }
+    }
+
+    let mut changed = true;
+    let mut passes = 0;
+    while changed && passes < 10 {
+        changed = false;
+        passes += 1;
+        for item in &file.items {
+            if let Item::Type(t) = item {
+                let name = t.ident.to_string();
+                if type_is_address(&t.ty, address_aliases) {
+                    if address_aliases.insert(name.clone()) {
+                        changed = true;
+                    }
+                }
+                if type_is_i128(&t.ty, i128_aliases) {
+                    if i128_aliases.insert(name) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_use_tree(
+    tree: &syn::UseTree,
+    prefix_ends_in_address: bool,
+    address_aliases: &mut HashSet<String>,
+    i128_aliases: &mut HashSet<String>,
+) {
+    match tree {
+        syn::UseTree::Path(p) => {
+            let is_address = p.ident == "Address";
+            collect_use_tree(&p.tree, is_address, address_aliases, i128_aliases);
+        }
+        syn::UseTree::Name(_) => {}
+        syn::UseTree::Rename(r) => {
+            if r.ident == "Address" || prefix_ends_in_address {
+                address_aliases.insert(r.rename.to_string());
+            }
+            if r.ident == "i128" {
+                i128_aliases.insert(r.rename.to_string());
+            }
+        }
+        syn::UseTree::Group(g) => {
+            for item in &g.items {
+                collect_use_tree(item, prefix_ends_in_address, address_aliases, i128_aliases);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
 }
 
 /// The parser's message, made actionable for tokenizer failures: syn reports
@@ -736,19 +832,56 @@ fn is_contractimpl(attrs: &[Attribute]) -> bool {
     })
 }
 
+fn has_auth_suppression(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(is_auth_suppression_attr)
+}
+
+fn is_auth_suppression_attr(attr: &Attribute) -> bool {
+    if !attr.path().is_ident("allow") {
+        return false;
+    }
+    let syn::Meta::List(meta_list) = &attr.meta else {
+        return false;
+    };
+    let Ok(nested) = meta_list.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return false;
+    };
+    for meta in nested {
+        if let syn::Meta::Path(p) = meta {
+            let idents: Vec<_> = p.segments.iter().map(|s| s.ident.to_string()).collect();
+            if idents.last().map(|s| s.as_str()) == Some("missing_require_auth") {
+                if idents.len() == 1
+                    || (idents.len() == 2
+                        && matches!(idents[0].as_str(), "soroban_testkit" | "testkit" | "audit"))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 struct FunctionVisitor<'a> {
     path: String,
     rules: &'a [Rule],
     findings: &'a mut Vec<Finding>,
     /// Set while visiting the items of a `#[contractimpl]` block.
     contract_impl: Option<EntryPoints>,
+    contract_impl_suppressed: bool,
+    helpers: &'a HashMap<String, Vec<&'a syn::Block>>,
+    address_aliases: &'a HashSet<String>,
+    i128_aliases: &'a HashSet<String>,
 }
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         let line = fn_line(&node.sig);
         // A free function is never an entry point, even when nested in one.
-        self.audit_function(&node.sig, &node.block, line, false);
+        let suppressed = has_auth_suppression(&node.attrs);
+        self.audit_function(&node.sig, &node.block, line, false, suppressed);
         self.audit_i128_arithmetic(&node.sig, &node.block);
         // Continues into nested items, which are audited as their own functions
         visit::visit_item_fn(self, node);
@@ -756,13 +889,16 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
 
     fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
         let outer = self.contract_impl;
+        let outer_suppressed = self.contract_impl_suppressed;
         self.contract_impl = is_contractimpl(&node.attrs).then_some(if node.trait_.is_some() {
             EntryPoints::AllFns
         } else {
             EntryPoints::PublicFns
         });
+        self.contract_impl_suppressed = has_auth_suppression(&node.attrs);
         visit::visit_item_impl(self, node);
         self.contract_impl = outer;
+        self.contract_impl_suppressed = outer_suppressed;
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
@@ -772,7 +908,8 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
             Some(EntryPoints::PublicFns) => matches!(node.vis, Visibility::Public(_)),
             None => false,
         };
-        self.audit_function(&node.sig, &node.block, line, entry_point);
+        let suppressed = self.contract_impl_suppressed || has_auth_suppression(&node.attrs);
+        self.audit_function(&node.sig, &node.block, line, entry_point, suppressed);
         self.audit_i128_arithmetic(&node.sig, &node.block);
         visit::visit_impl_item_fn(self, node);
     }
@@ -789,14 +926,21 @@ impl FunctionVisitor<'_> {
         body: &syn::Block,
         line: usize,
         entry_point: bool,
+        suppressed: bool,
     ) {
         let name = sig.ident.to_string();
 
         // Rule 1: an entry point's Address parameter that's never checked
         // with require_auth. Helpers are reached through an entry point.
-        let address_params = address_typed_params(sig);
-        if entry_point && self.runs(Rule::MissingRequireAuth) && !address_params.is_empty() {
+        let address_params = address_typed_params(sig, self.address_aliases);
+        if entry_point
+            && !suppressed
+            && self.runs(Rule::MissingRequireAuth)
+            && !address_params.is_empty()
+        {
             let mut auth_visitor = RequireAuthVisitor {
+                helpers: self.helpers,
+                visiting: HashSet::new(),
                 has_require_auth: false,
             };
             auth_visitor.visit_block(body);
@@ -855,10 +999,8 @@ impl FunctionVisitor<'_> {
         let mut i128_bindings: HashSet<String> = HashSet::new();
         for arg in &sig.inputs {
             if let FnArg::Typed(pat_type) = arg {
-                if type_is_i128(&pat_type.ty) {
-                    if let Pat::Ident(ident) = &*pat_type.pat {
-                        i128_bindings.insert(ident.ident.to_string());
-                    }
+                if type_is_i128(&pat_type.ty, self.i128_aliases) {
+                    extract_pat_idents(&pat_type.pat, &mut i128_bindings);
                 }
             }
         }
@@ -867,33 +1009,38 @@ impl FunctionVisitor<'_> {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
             i128_bindings,
+            i128_aliases: self.i128_aliases,
             findings: self.findings,
         };
         visitor.visit_block(body);
     }
 }
 
-fn address_typed_params(sig: &Signature) -> Vec<String> {
+fn address_typed_params(sig: &Signature, aliases: &HashSet<String>) -> Vec<String> {
     sig.inputs
         .iter()
         .filter_map(|arg| match arg {
-            FnArg::Typed(pat_type) if type_is_address(&pat_type.ty) => match &*pat_type.pat {
-                Pat::Ident(ident) => Some(ident.ident.to_string()),
-                _ => Some("<pattern>".to_string()),
-            },
+            FnArg::Typed(pat_type) if type_is_address(&pat_type.ty, aliases) => {
+                match &*pat_type.pat {
+                    Pat::Ident(ident) => Some(ident.ident.to_string()),
+                    _ => Some("<pattern>".to_string()),
+                }
+            }
             _ => None,
         })
         .collect()
 }
 
-fn type_is_address(ty: &Type) -> bool {
+fn type_is_address(ty: &Type, aliases: &HashSet<String>) -> bool {
     match ty {
-        Type::Reference(r) => type_is_address(&r.elem),
-        Type::Path(p) => p
-            .path
-            .segments
-            .last()
-            .is_some_and(|seg| seg.ident == "Address"),
+        Type::Reference(r) => type_is_address(&r.elem, aliases),
+        Type::Group(g) => type_is_address(&g.elem, aliases),
+        Type::Paren(p) => type_is_address(&p.elem, aliases),
+        Type::Path(p) => {
+            p.path.segments.last().is_some_and(|seg| {
+                seg.ident == "Address" || aliases.contains(&seg.ident.to_string())
+            })
+        }
         _ => false,
     }
 }
@@ -934,6 +1081,7 @@ struct I128ArithmeticVisitor<'a> {
     path: String,
     fn_name: String,
     i128_bindings: HashSet<String>,
+    i128_aliases: &'a HashSet<String>,
     findings: &'a mut Vec<Finding>,
 }
 
@@ -942,12 +1090,21 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
     fn visit_item(&mut self, _node: &'ast Item) {}
 
     fn visit_local(&mut self, node: &'ast Local) {
+        let mut is_i128 = false;
         if let Pat::Type(pat_type) = &node.pat {
-            if type_is_i128(&pat_type.ty) {
-                if let Pat::Ident(ident) = &*pat_type.pat {
-                    self.i128_bindings.insert(ident.ident.to_string());
+            if type_is_i128(&pat_type.ty, self.i128_aliases) {
+                is_i128 = true;
+            }
+        }
+        if !is_i128 {
+            if let Some(init) = &node.init {
+                if self.is_i128_expr(&init.expr) {
+                    is_i128 = true;
                 }
             }
+        }
+        if is_i128 {
+            extract_pat_idents(&node.pat, &mut self.i128_bindings);
         }
         visit::visit_local(self, node);
     }
@@ -985,6 +1142,21 @@ fn is_arithmetic(op: &BinOp) -> bool {
 }
 
 impl I128ArithmeticVisitor<'_> {
+    fn is_i128_expr(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Path(p) => p
+                .path
+                .get_ident()
+                .is_some_and(|ident| self.i128_bindings.contains(&ident.to_string())),
+            Expr::Lit(lit) => matches!(&lit.lit, syn::Lit::Int(i) if i.suffix() == "i128"),
+            Expr::Reference(r) => self.is_i128_expr(&r.expr),
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.is_i128_expr(&u.expr),
+            Expr::Paren(p) => self.is_i128_expr(&p.expr),
+            Expr::Group(g) => self.is_i128_expr(&g.expr),
+            _ => false,
+        }
+    }
+
     /// Whether any operand anywhere in this arithmetic expression (looking
     /// through nested `+ - * /` and parentheses) is an i128 value.
     fn arithmetic_touches_i128(&self, expr: &Expr) -> bool {
@@ -1020,6 +1192,8 @@ impl I128ArithmeticVisitor<'_> {
                 .get_ident()
                 .is_some_and(|ident| self.i128_bindings.contains(&ident.to_string())),
             Expr::Lit(lit) => matches!(&lit.lit, syn::Lit::Int(i) if i.suffix() == "i128"),
+            Expr::Reference(r) => self.touches_i128(&r.expr),
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.touches_i128(&u.expr),
             Expr::Paren(p) => self.touches_i128(&p.expr),
             Expr::Group(g) => self.touches_i128(&g.expr),
             _ => false,
@@ -1027,28 +1201,103 @@ impl I128ArithmeticVisitor<'_> {
     }
 }
 
-fn type_is_i128(ty: &Type) -> bool {
-    matches!(ty, Type::Path(p) if p.path.is_ident("i128"))
+fn type_is_i128(ty: &Type, aliases: &HashSet<String>) -> bool {
+    match ty {
+        Type::Reference(r) => type_is_i128(&r.elem, aliases),
+        Type::Group(g) => type_is_i128(&g.elem, aliases),
+        Type::Paren(p) => type_is_i128(&p.elem, aliases),
+        Type::Path(p) => {
+            p.path.is_ident("i128")
+                || p.path.segments.last().is_some_and(|seg| {
+                    seg.ident == "i128" || aliases.contains(&seg.ident.to_string())
+                })
+        }
+        _ => false,
+    }
 }
 
-/// Visitor that checks if require_auth is called anywhere in the function body.
-/// This replaces text heuristics with proper AST traversal that is insensitive
-/// to formatting changes (e.g., spacing around method calls).
-struct RequireAuthVisitor {
+fn extract_pat_idents(pat: &Pat, bindings: &mut HashSet<String>) {
+    match pat {
+        Pat::Ident(ident) => {
+            bindings.insert(ident.ident.to_string());
+        }
+        Pat::Reference(r) => extract_pat_idents(&r.pat, bindings),
+        Pat::Type(t) => extract_pat_idents(&t.pat, bindings),
+        Pat::Paren(p) => extract_pat_idents(&p.pat, bindings),
+        Pat::Tuple(t) => {
+            for elem in &t.elems {
+                extract_pat_idents(elem, bindings);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Visitor that checks if require_auth is called anywhere in the function body
+/// or in delegated helper functions.
+struct RequireAuthVisitor<'a> {
+    helpers: &'a HashMap<String, Vec<&'a syn::Block>>,
+    visiting: HashSet<String>,
     has_require_auth: bool,
 }
 
-impl<'ast> Visit<'ast> for RequireAuthVisitor {
+impl<'ast> Visit<'ast> for RequireAuthVisitor<'_> {
     // A nested function's require_auth does not authorize the outer function
     fn visit_item(&mut self, _node: &'ast Item) {}
 
     fn visit_expr(&mut self, node: &'ast Expr) {
-        if let Expr::MethodCall(mc) = node {
-            if mc.method == "require_auth" {
-                self.has_require_auth = true;
+        if self.has_require_auth {
+            return;
+        }
+        match node {
+            Expr::MethodCall(mc) => {
+                if mc.method == "require_auth" || mc.method == "require_auth_for_args" {
+                    self.has_require_auth = true;
+                    return;
+                }
+                let method_name = mc.method.to_string();
+                if self.check_helper_auth(&method_name) {
+                    self.has_require_auth = true;
+                    return;
+                }
             }
+            Expr::Call(call) => {
+                if let Expr::Path(p) = &*call.func {
+                    if let Some(seg) = p.path.segments.last() {
+                        let fn_name = seg.ident.to_string();
+                        if self.check_helper_auth(&fn_name) {
+                            self.has_require_auth = true;
+                            return;
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         visit::visit_expr(self, node);
+    }
+}
+
+impl RequireAuthVisitor<'_> {
+    fn check_helper_auth(&mut self, name: &str) -> bool {
+        if let Some(blocks) = self.helpers.get(name) {
+            if self.visiting.insert(name.to_string()) {
+                for block in blocks {
+                    let mut inner_visitor = RequireAuthVisitor {
+                        helpers: self.helpers,
+                        visiting: self.visiting.clone(),
+                        has_require_auth: false,
+                    };
+                    inner_visitor.visit_block(block);
+                    if inner_visitor.has_require_auth {
+                        self.visiting.remove(name);
+                        return true;
+                    }
+                }
+                self.visiting.remove(name);
+            }
+        }
+        false
     }
 }
 
@@ -1870,5 +2119,228 @@ impl Vault {
             collection.skipped,
             vec![(tree.root.join("target"), "--exclude")]
         );
+    }
+
+    // ---- #141: auth rule exemptions -------------------------------------
+
+    #[test]
+    fn auth_suppression_allows_intentional_open_entry_points() {
+        let src = r#"
+#[contractimpl]
+impl Contract {
+    #[allow(soroban_testkit::missing_require_auth)]
+    pub fn open_scoped(who: Address) {}
+
+    #[allow(missing_require_auth)]
+    pub fn open_unscoped(who: Address) {}
+
+    #[allow(testkit::missing_require_auth)]
+    pub fn open_testkit(who: Address) {}
+
+    #[allow(clippy::too_many_arguments, soroban_testkit::missing_require_auth)]
+    pub fn open_combined(who: Address) {}
+
+    pub fn unannotated(who: Address) {}
+}
+
+#[allow(soroban_testkit::missing_require_auth)]
+#[contractimpl]
+impl OpenImpl {
+    pub fn init(admin: Address) {}
+}
+"#;
+        assert_eq!(auth_findings(src), vec![16]);
+    }
+
+    #[test]
+    fn malformed_allow_annotations_do_not_suppress_or_panic() {
+        let src = r#"
+#[contractimpl]
+impl Contract {
+    #[allow]
+    pub fn bare_allow(who: Address) {}
+
+    #[allow = "missing_require_auth"]
+    pub fn name_value_allow(who: Address) {}
+
+    #[allow()]
+    pub fn empty_allow(who: Address) {}
+
+    #[allow(123)]
+    pub fn literal_allow(who: Address) {}
+
+    #[allow(unused_variables)]
+    pub fn unrelated_allow(who: Address) {}
+
+    #[allow(clippy::missing_require_auth)]
+    pub fn wrong_scope_allow(who: Address) {}
+}
+"#;
+        assert_eq!(auth_findings(src), vec![5, 8, 11, 14, 17, 20]);
+    }
+
+    // ---- #135: authorization checked in helper --------------------------
+
+    #[test]
+    fn delegated_helper_direct_check_satisfies_auth_rule() {
+        let src = r#"
+fn check_caller(caller: &Address) {
+    caller.require_auth();
+}
+
+impl Contract {
+    fn verify_self(&self, user: &Address) {
+        user.require_auth_for_args(());
+    }
+
+    fn assert_admin(admin: &Address) {
+        admin.require_auth();
+    }
+}
+
+#[contractimpl]
+impl Contract {
+    pub fn via_free_fn(env: Env, caller: Address) {
+        check_caller(&caller);
+    }
+
+    pub fn via_self_method(&self, env: Env, user: Address) {
+        self.verify_self(&user);
+    }
+
+    pub fn via_assoc_fn(env: Env, admin: Address) {
+        Self::assert_admin(&admin);
+    }
+}
+"#;
+        assert_eq!(auth_findings(src), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn delegated_helper_indirect_check_satisfies_auth_rule() {
+        let src = r#"
+fn step_one(user: &Address) {
+    step_two(user);
+}
+
+fn step_two(user: &Address) {
+    user.require_auth();
+}
+
+#[contractimpl]
+impl Contract {
+    pub fn execute(env: Env, user: Address) {
+        step_one(&user);
+    }
+}
+"#;
+        assert_eq!(auth_findings(src), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn recursive_helpers_without_require_auth_still_report() {
+        let src = r#"
+fn ping(a: &Address) {
+    pong(a);
+}
+
+fn pong(a: &Address) {
+    ping(a);
+}
+
+#[contractimpl]
+impl Contract {
+    pub fn execute(env: Env, user: Address) {
+        ping(&user);
+    }
+}
+"#;
+        assert_eq!(auth_findings(src), vec![12]);
+    }
+
+    // ---- #140: arithmetic i128 reference tracking -----------------------
+
+    #[test]
+    fn i128_reference_parameters_and_deref_arithmetic_are_detected() {
+        let src = r#"
+fn add_ref(a: &i128) -> i128 {
+    *a + 1
+}
+
+fn sub_mut_ref(a: &mut i128) -> i128 {
+    *a - 2
+}
+"#;
+        assert_eq!(
+            rules_of(src, &[Rule::UncheckedI128Arithmetic]),
+            vec![
+                ("unchecked-i128-arithmetic", 3),
+                ("unchecked-i128-arithmetic", 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn i128_simple_aliases_and_reference_bindings_are_detected() {
+        let src = r#"
+type Balance = i128;
+
+fn aliases(a: i128, b: Balance) -> i128 {
+    let alias = a;
+    let r = &a;
+    let deref_alias = *r;
+    let x = alias + 1;
+    let y = *r * 2;
+    let z = deref_alias - 3;
+    b / 2
+}
+"#;
+        assert_eq!(
+            rules_of(src, &[Rule::UncheckedI128Arithmetic]),
+            vec![
+                ("unchecked-i128-arithmetic", 8),
+                ("unchecked-i128-arithmetic", 9),
+                ("unchecked-i128-arithmetic", 10),
+                ("unchecked-i128-arithmetic", 11),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_i128_aliases_and_references_are_not_flagged() {
+        let src = r#"
+fn safe_u128(a: u128) -> u128 {
+    let b = a;
+    let r = &b;
+    *r + 1
+}
+"#;
+        assert_eq!(
+            rules_of(src, &[Rule::UncheckedI128Arithmetic]),
+            Vec::<(&'static str, usize)>::new()
+        );
+    }
+
+    // ---- #137: qualified Address parameter detection --------------------
+
+    #[test]
+    fn qualified_and_aliased_address_parameters_are_detected() {
+        let src = r#"
+use soroban_sdk::Address as AccountId;
+type UserAddress = soroban_sdk::Address;
+type ChainedAddress = UserAddress;
+
+#[contractimpl]
+impl Contract {
+    pub fn pay_qualified(to: soroban_sdk::Address) {}
+    pub fn pay_rooted(to: ::soroban_sdk::Address) {}
+    pub fn pay_ref_qualified(to: &soroban_sdk::Address) {}
+    pub fn pay_use_alias(to: AccountId) {}
+    pub fn pay_ref_use_alias(to: &AccountId) {}
+    pub fn pay_type_alias(to: UserAddress) {}
+    pub fn pay_chained_alias(to: ChainedAddress) {}
+}
+"#;
+        assert_eq!(auth_findings(src), vec![8, 9, 10, 11, 12, 13, 14]);
     }
 }
