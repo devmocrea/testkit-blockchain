@@ -48,45 +48,32 @@ fn describe_transfer_result(result: &TransferResult) -> String {
 /// A deployed Stellar Asset Contract test double, with one-line mint/balance
 /// helpers so tests don't hand-roll SAC setup boilerplate.
 ///
-/// # Environment binding
+/// # Multiple tokens in one environment
 ///
-/// A `TestToken` is bound to the [`soroban_sdk::Env`] it was created from: it
-/// holds a cloned handle to that environment together with the SAC's contract
-/// address and the admin address that registered it. All three belong to the
-/// same host, so a fixture must never be used with a different environment.
-///
-/// [`TestEnv::reset`] replaces the underlying host with a fresh one. Values
-/// created before the reset — token fixtures, the [`Address`]es passed to
-/// them, and any `TokenClient` — stay attached to the *discarded* host. They
-/// do not become invalid and do not fail loudly: a stale token keeps reading
-/// and mutating the old state, so a test can silently assert against balances
-/// that no longer exist. Rebuild the fixture after a reset instead of
-/// carrying it across, and regenerate the addresses you pass to it. The same
-/// applies to the fresh environment produced by [`TestEnv::clone_config`].
-///
-/// Mixing values from two environments can fail: an `Address` created in one
-/// host may be an unknown object reference in another. Recreate every value
-/// you need from the environment you intend to keep using.
+/// Every call to [`TestEnv::token`] deploys a separate SAC backed by a
+/// different randomly-generated asset, with its own contract address and
+/// admin. Fixtures never share a balance ledger: the same [`Address`] can
+/// hold a different balance in each token, and [`TestToken::total_tracked`]
+/// counts only the mints made through that particular fixture.
 ///
 /// # Example
 ///
 /// ```
 /// use soroban_testkit::core::TestEnv;
 ///
-/// let mut env = TestEnv::new();
-/// let stale = env.token();
-/// let stale_alice = env.address();
-/// stale.mint_raw(&stale_alice, 100);
-///
-/// env.reset();
-///
-/// // `stale` and `stale_alice` still refer to the discarded environment.
-/// // Rebuild the fixture and its addresses from the reset environment.
-/// let token = env.token();
+/// let env = TestEnv::new();
+/// let first = env.token();
+/// let second = env.token();
 /// let alice = env.address();
-/// token.assert_balance(&alice, 0);
-/// token.mint_raw(&alice, 25);
-/// token.assert_balance(&alice, 25);
+///
+/// assert_ne!(first.address(), second.address());
+/// first.mint_raw(&alice, 100);
+/// second.mint_raw(&alice, 7);
+///
+/// first.assert_balance(&alice, 100);
+/// second.assert_balance(&alice, 7);
+/// assert_eq!(first.total_tracked(), 100);
+/// assert_eq!(second.total_tracked(), 7);
 /// ```
 pub struct TestToken {
     env: Env,
@@ -472,11 +459,9 @@ impl TestToken {
 impl TestEnv {
     /// Deploy a Stellar Asset Contract with the standard 7 decimals.
     ///
-    /// The returned [`TestToken`] is bound to this `TestEnv`'s current
-    /// environment. After [`TestEnv::reset`] (or on a
-    /// [`TestEnv::clone_config`] result), call `token()` again to get a
-    /// fixture attached to the new environment; see [`TestToken`] for the
-    /// full lifetime rules.
+    /// Each call deploys a fresh, independent SAC with its own contract
+    /// address, admin, and balance ledger; see [`TestToken`] for the
+    /// multi-token guarantees.
     ///
     /// # Example
     ///
@@ -559,58 +544,89 @@ mod tests {
     }
 
     #[test]
-    fn token_fixture_keeps_observing_the_discarded_env_after_reset() {
-        let mut env = TestEnv::new();
-        let stale = env.token();
-        let stale_alice = env.address();
-        stale.mint_raw(&stale_alice, 100);
 
-        env.reset();
-
-        // The old fixture and address still see the discarded host, silently.
-        stale.assert_balance(&stale_alice, 100);
-        assert_eq!(stale.total_tracked(), 100);
-
-        // A rebuilt fixture on the new host starts from zero balances.
-        let fresh = env.token();
-        let fresh_alice = env.address();
-        fresh.assert_balance(&fresh_alice, 0);
-        assert_eq!(fresh.total_tracked(), 0);
+    fn two_tokens_in_one_environment_have_distinct_addresses() {
+        let env = TestEnv::new();
+        let first = env.token();
+        let second = env.token();
+        assert_ne!(first.address(), second.address());
     }
 
     #[test]
-    fn rebuilt_token_fixture_is_usable_after_reset() {
-        let mut env = TestEnv::new();
-        let stale = env.token();
-        let stale_alice = env.address();
-        stale.mint_raw(&stale_alice, 5);
-
-        env.reset();
-
-        let token = env.token();
+    fn the_same_address_has_independent_balances_in_each_token() {
+        let env = TestEnv::new();
+        let first = env.token();
+        let second = env.token();
         let alice = env.address();
-        token.mint_raw(&alice, 42);
-        token.assert_balance(&alice, 42);
-        assert_eq!(token.total_tracked(), 42);
-        // The stale fixture is unaffected by mints through the rebuilt one.
-        stale.assert_balance(&stale_alice, 5);
-        assert_eq!(stale.total_tracked(), 5);
+
+        first.mint_raw(&alice, 100);
+        second.mint_raw(&alice, 7);
+
+        first.assert_balance(&alice, 100);
+        second.assert_balance(&alice, 7);
     }
 
     #[test]
-    fn addresses_from_before_reset_cannot_be_used_with_a_rebuilt_token() {
-        let mut env = TestEnv::new();
-        let stale = env.token();
-        let stale_alice = env.address();
-        stale.mint_raw(&stale_alice, 100);
-        env.reset();
+    fn minting_into_one_token_does_not_affect_another_recipient() {
+        let env = TestEnv::new();
+        let first = env.token();
+        let second = env.token();
+        let alice = env.address();
+        let bob = env.address();
 
-        let token = env.token();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            token.balance(&stale_alice);
-        }));
-        assert!(result.is_err());
+        first.mint_raw(&alice, 100);
+        second.mint_raw(&bob, 5);
+
+        first.assert_balance(&alice, 100);
+        first.assert_balance(&bob, 0);
+        second.assert_balance(&alice, 0);
+        second.assert_balance(&bob, 5);
     }
+
+    #[test]
+    fn total_tracked_is_counted_per_fixture() {
+        let env = TestEnv::new();
+        let first = env.token();
+        let second = env.token();
+        let alice = env.address();
+
+        first.mint_raw(&alice, 100);
+        first.mint(&alice, 1);
+        second.mint_raw(&alice, 7);
+
+        assert_eq!(first.total_tracked(), 100 + 10i128.pow(7));
+        assert_eq!(second.total_tracked(), 7);
+    }
+
+    #[test]
+    fn a_transfer_in_one_token_leaves_the_other_token_untouched() {
+        let env = TestEnv::new();
+        let first = env.token();
+        let second = env.token();
+        let alice = env.address();
+        let bob = env.address();
+        first.mint_raw(&alice, 100);
+        second.mint_raw(&alice, 100);
+
+        TokenClient::new(env.env(), &first.address())
+            .mock_auths(&[MockAuth {
+                address: &alice,
+                invoke: &MockAuthInvoke {
+                    contract: &first.address(),
+                    fn_name: "transfer",
+                    args: (alice.clone(), bob.clone(), 30_i128).into_val(env.env()),
+                    sub_invokes: &[],
+                },
+            }])
+            .transfer(&alice, soroban_sdk::MuxedAddress::from(bob.clone()), &30);
+
+        first.assert_balance(&alice, 70);
+        first.assert_balance(&bob, 30);
+        second.assert_balance(&alice, 100);
+        second.assert_balance(&bob, 0);
+    }
+
+    #[test]
 
     fn insufficient_balance_helper_matches_the_sac_error_and_leaves_balances_unchanged() {
         let env = TestEnv::new();
@@ -693,6 +709,7 @@ mod tests {
         token.assert_insufficient_balance_transfer(&alice, &bob, 11);
         token.assert_transfer_unauthorized(&alice, &bob, 1);
         token.assert_unauthorized_transfer(&alice, &bob, 1);
+
     }
 
     #[test]
