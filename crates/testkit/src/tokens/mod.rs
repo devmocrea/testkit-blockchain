@@ -20,4 +20,4 @@
 
 mod sac;
 
-pub use sac::TestToken;
+pub use sac::{TestToken, SAC_DECIMALS};

@@ -46,7 +46,7 @@ mod api_diff_check {
     use crate::events::{CapturedEvent, EventLog};
     use crate::money::{adversarial_amounts, amounts_in, bps_values, Conservation};
     use crate::tokens::TestToken;
-    use crate::ttl::StorageKind;
+    use crate::ttl::{ExpiryContext, StorageKind};
 
     #[test]
     fn documented_public_items_exist() {
@@ -69,6 +69,7 @@ mod api_diff_check {
         let _matrix: Option<AuthMatrix> = None;
         let _token: Option<TestToken> = None;
         let _kind: Option<StorageKind> = None;
+        let _ctx: Option<ExpiryContext> = None;
         drop((
             _env,
             _code,
@@ -80,6 +81,7 @@ mod api_diff_check {
             _matrix,
             _token,
             _kind,
+            _ctx,
         ));
     }
 }

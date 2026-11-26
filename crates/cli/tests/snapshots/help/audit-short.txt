@@ -10,8 +10,8 @@ Arguments:
 Options:
       --no-color             Never emit ANSI color codes, here or from tools this command runs
                              (e.g. cargo). Same as setting the `NO_COLOR` environment variable
-      --strict               Exit 1 if any findings are reported. Without it, findings are
-                             printed and the command still exits 0
+      --strict               Exit 1 if any findings are reported, or 2 if a file failed to parse.
+                             Without it, findings are printed and the command still exits 0
       --json                 Print findings as a JSON document (`schema_version` 1) on stdout
                              instead of text
   -q, --quiet                Print only results and errors; suppress advisory notes. Cannot be
@@ -22,6 +22,16 @@ Options:
   -v, --verbose              Print extra diagnostics (commands run, files scanned) to stderr
       --exclude-rule <RULE>  Skip this rule (repeatable, or comma-separated). Applied after
                              --rule; naming a rule in both is an error [possible values: missing-require-auth, unchecked-i128-arithmetic, missing-ttl-bump]
+      --include <GLOB>       Audit only .rs files matching this glob (repeatable, or
+                             comma-separated). Globs match paths relative to PATH with `/`
+                             separators: `*` and `?` stay within one path segment, `**` spans
+                             any number of segments, and a glob without `/` matches a file or
+                             directory name at any depth. A file also matches when one of its
+                             parent directories does. Without --include, every .rs file is
+                             audited
+      --exclude <GLOB>       Skip .rs files and directories matching this glob (repeatable, or
+                             comma-separated), e.g. generated or vendored code. Same syntax as
+                             --include and applied after it; skipped directories are not read
   -h, --help                 Print help (see more with '--help')
 
 EXAMPLES:
@@ -29,4 +39,6 @@ EXAMPLES:
     soroban-testkit audit ./src --strict
     soroban-testkit audit ./src --rule missing-require-auth --rule missing-ttl-bump
     soroban-testkit audit ./src --exclude-rule unchecked-i128-arithmetic
+    soroban-testkit audit . --exclude target --exclude '**/generated/**'
+    soroban-testkit audit . --include 'contracts/**' --exclude '*_test.rs'
     soroban-testkit audit ./src --json | jq '.findings'

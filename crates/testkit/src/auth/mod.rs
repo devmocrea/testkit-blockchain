@@ -26,4 +26,4 @@
 
 mod matrix;
 
-pub use matrix::AuthMatrix;
+pub use matrix::{AuthMatrix, MatrixCell, MatrixError, MatrixReport};

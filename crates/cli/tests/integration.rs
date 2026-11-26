@@ -121,8 +121,11 @@ fn audit_reports_no_findings_on_a_clean_directory() {
 #[test]
 fn audit_reads_source_from_stdin_when_path_is_dash() {
     let src = r#"
-        fn transfer(to: Address, amount: i128) {
-            let total = amount + 1;
+        #[contractimpl]
+        impl Token {
+            pub fn transfer(to: Address, amount: i128) {
+                let total = amount + 1;
+            }
         }
     "#;
     let output = run_cli_with_stdin(&["audit", "-"], src);
@@ -163,11 +166,21 @@ fn audit_stdin_reports_no_findings_on_empty_input() {
 }
 
 #[test]
-fn audit_stdin_reports_no_findings_on_invalid_input() {
+fn audit_stdin_reports_invalid_input_as_skipped() {
     let output = run_cli_with_stdin(&["audit", "-"], "fn {{{ not valid rust");
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Still exit 0: an editor buffer may be mid-edit (#144).
     assert!(output.status.success(), "stdout: {stdout}");
     assert!(stdout.contains("no findings"), "{stdout}");
+    assert!(
+        stdout.contains("1 file could not be parsed and was not audited"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("warning: skipped <stdin>:1:"),
+        "the skipped file is named with its parse position: {stderr}"
+    );
 }
 
 #[test]
@@ -766,4 +779,174 @@ fn audit_rule_selection_rejects_unknown_and_contradictory_rules_as_usage_errors(
         assert!(stderr.starts_with("error:"), "{stderr}");
         assert!(output.stdout.is_empty(), "{args:?}");
     }
+}
+
+// ---- #142 / #144: audit path filters and parse-error reporting ----------
+
+/// A temp crate tree for audit tests: `src/lib.rs` (one entry-point finding),
+/// `src/generated/bindings.rs` (one finding), `vendor/dep/lib.rs` (one
+/// finding) and `src/broken.rs` (not valid Rust).
+fn audit_tree(test_name: &str) -> IsolatedDir {
+    let iso = isolated_dir(test_name).expect("temp dir");
+    let finding = |name: &str| {
+        format!("#[contractimpl]\nimpl C {{\n    pub fn {name}(to: Address) {{}}\n}}\n")
+    };
+    for (path, body) in [
+        ("src/lib.rs", finding("lib_entry")),
+        ("src/generated/bindings.rs", finding("generated_entry")),
+        ("vendor/dep/lib.rs", finding("vendored_entry")),
+        ("src/broken.rs", "pub fn broken( {\n".to_string()),
+    ] {
+        let file = iso.path.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, body).unwrap();
+    }
+    iso
+}
+
+fn audit_tree_json(iso: &IsolatedDir, extra: &[&str]) -> (Output, String) {
+    let root = iso.path.to_str().unwrap().to_string();
+    let mut args = vec!["audit", root.as_str(), "--json"];
+    args.extend_from_slice(extra);
+    let output = run_cli(&args);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    (output, stdout)
+}
+
+#[test]
+fn audit_exclude_skips_generated_and_vendored_directories() {
+    let iso = audit_tree("audit_exclude");
+    let (output, all) = audit_tree_json(&iso, &[]);
+    assert!(output.status.success(), "{all}");
+    for name in ["lib_entry", "generated_entry", "vendored_entry"] {
+        assert!(all.contains(name), "{name} missing without filters: {all}");
+    }
+
+    let (output, filtered) =
+        audit_tree_json(&iso, &["--exclude", "generated", "--exclude", "vendor/**"]);
+    assert!(output.status.success(), "{filtered}");
+    assert!(filtered.contains("lib_entry"), "{filtered}");
+    assert!(!filtered.contains("generated_entry"), "{filtered}");
+    assert!(!filtered.contains("vendored_entry"), "{filtered}");
+    assert!(filtered.contains("\"finding_count\":1,"), "{filtered}");
+}
+
+#[test]
+fn audit_include_limits_the_audit_to_matching_paths() {
+    let iso = audit_tree("audit_include");
+    let (output, stdout) = audit_tree_json(&iso, &["--include", "vendor"]);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("vendored_entry"), "{stdout}");
+    assert!(stdout.contains("\"finding_count\":1,"), "{stdout}");
+    // src/broken.rs was not selected, so it is neither audited nor skipped.
+    assert!(stdout.contains("\"skipped\":[]"), "{stdout}");
+}
+
+#[test]
+fn audit_filters_that_match_no_file_are_an_error() {
+    let iso = audit_tree("audit_no_match");
+    let (output, _) = audit_tree_json(&iso, &["--include", "contracts/**"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("matches --include/--exclude (4 filtered out)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn audit_filters_are_a_usage_error_with_stdin() {
+    let output = run_cli_with_stdin(&["audit", "-", "--exclude", "target"], "fn ok() {}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("cannot be used when reading from stdin"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn audit_reports_unparseable_files_with_path_and_parser_error() {
+    let iso = audit_tree("audit_parse_errors");
+    let root = iso.path.to_str().unwrap();
+
+    let text = run_cli(&["audit", root]);
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(text.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("warning: skipped src/broken.rs:1:"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("not valid Rust, so it was not audited"),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("1 file could not be parsed and was not audited"),
+        "{stdout}"
+    );
+
+    let (_, json) = audit_tree_json(&iso, &[]);
+    assert!(
+        json.contains("\"skipped\":[{\"file\":\"src/broken.rs\",\"line\":1,\"column\":"),
+        "{json}"
+    );
+    // stdout stays one JSON document; the warning is not printed with --json.
+    let json_run = run_cli(&["audit", root, "--json"]);
+    assert!(
+        !String::from_utf8_lossy(&json_run.stderr).contains("warning: skipped"),
+        "--json keeps skipped files in the document only"
+    );
+
+    // Excluding the broken file silences it.
+    let (_, excluded) = audit_tree_json(&iso, &["--exclude", "broken.rs"]);
+    assert!(excluded.contains("\"skipped\":[]"), "{excluded}");
+}
+
+#[test]
+fn audit_auth_findings_cover_entry_points_but_not_helpers() {
+    let src = r#"
+#[contractimpl]
+impl Vault {
+    pub fn withdraw(env: Env, to: Address) {}
+}
+
+fn send_to(env: &Env, to: &Address) {}
+
+impl Vault {
+    pub fn internal(to: Address) {}
+}
+"#;
+    let output = run_cli_with_stdin(&["audit", "-", "--json"], src);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert_eq!(
+        audit_json_findings(&stdout),
+        vec![(4, "missing-require-auth".to_string())],
+        "{stdout}"
+    );
+}
+
+#[test]
+fn audit_qualified_and_aliased_address_fixture() {
+    let output = run_cli(&[
+        "audit",
+        "crates/cli/tests/fixtures/audit/qualified_address.rs",
+        "--json",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert_eq!(
+        audit_json_findings(&stdout),
+        vec![
+            (13, "missing-require-auth".to_string()),
+            (14, "missing-require-auth".to_string()),
+            (15, "missing-require-auth".to_string()),
+            (16, "missing-require-auth".to_string()),
+            (17, "missing-require-auth".to_string()),
+            (18, "missing-require-auth".to_string()),
+        ],
+        "{stdout}"
+    );
 }

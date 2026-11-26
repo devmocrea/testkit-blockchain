@@ -589,8 +589,10 @@ Shells out to the underlying coverage tool. Its job is knowing the right flags f
 Empirically discovers resource ceilings rather than guessing them.
 
 ```
-soroban-testkit limits --contract <path-to-wasm> --fn <name> --ramp <param> [--jobs <n>] [--dry-run]
+soroban-testkit limits --contract <path-to-wasm> --fn <name> --ramp <param> [--start <n>] [--step <n>] [--jobs <n>] [--dry-run]
 ```
+
+`--start <n>` (default 0) and `--step <n>` (default 1) choose the ramp values: the search probes `start + k*step` for k = 0, 1, 2, 4, and so on, so a negative `--step` probes downwards. Both must fit the ramp parameter's type, and `--step` cannot exceed that type's range; violations are refused before any probe runs.
 
 Invokes the function with an increasing parameter (e.g. recipient count) until it exceeds resource limits, then reports the last successful value plus instruction count, ledger reads/writes, and transaction size at that point.
 
@@ -608,7 +610,7 @@ Static checks over a contract crate. Start with three, each independently useful
 2. Arithmetic on `i128` outside a checked/trapping context
 3. Storage reads with no corresponding TTL bump on the same key
 
-Output: file, line, rule, severity, and a one-line explanation. Exit non-zero on findings when `--strict`.
+Output: file, line, rule, severity, and a one-line explanation. Exit status: `0` when the scan completes, `1` when `--strict` is passed and findings are reported, and `2` for invalid input (a missing or unreadable PATH, or, with `--strict`, a file that fails to parse).
 
 **This is not a security product.** It is a linter with three heuristics. Say so in the output footer and in the README. Overclaiming here would be worse than not shipping it.
 

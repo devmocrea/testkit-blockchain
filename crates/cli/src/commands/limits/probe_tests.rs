@@ -18,6 +18,8 @@ fn json_reports_the_boundary_without_removing_legacy_fields() {
         contract: "fixture.wasm".into(),
         function: "run".into(),
         ramp: "amount".into(),
+        start: 0,
+        step: 1,
         jobs: 1,
         probe_timeout: 120,
         repeat: 1,
@@ -36,7 +38,7 @@ fn json_reports_the_boundary_without_removing_legacy_fields() {
         &cost,
         None,
         None,
-        SEARCH_CEILING,
+        i64::from(SEARCH_CEILING),
         None,
     ))
     .unwrap();
@@ -52,7 +54,7 @@ fn json_reports_the_boundary_without_removing_legacy_fields() {
         &cost,
         Some(8),
         Some("contract_rejected"),
-        SEARCH_CEILING,
+        i64::from(SEARCH_CEILING),
         None,
     ))
     .unwrap();
@@ -67,6 +69,8 @@ fn json_reports_repeat_spread_and_generated_items_for_vec_ramps() {
         contract: "fixture.wasm".into(),
         function: "batch_payout".into(),
         ramp: "recipients".into(),
+        start: 0,
+        step: 1,
         jobs: 1,
         probe_timeout: 120,
         repeat: 3,
@@ -85,7 +89,7 @@ fn json_reports_repeat_spread_and_generated_items_for_vec_ramps() {
         &cost,
         None,
         None,
-        MAX_VEC_RAMP_ITEMS,
+        i64::from(MAX_VEC_RAMP_ITEMS),
         Some(512),
     ))
     .unwrap();
@@ -110,7 +114,7 @@ fn json_reports_repeat_spread_and_generated_items_for_vec_ramps() {
         &cost,
         None,
         None,
-        SEARCH_CEILING,
+        i64::from(SEARCH_CEILING),
         None,
     ))
     .unwrap();
@@ -123,6 +127,8 @@ fn zero_timeout_is_rejected_before_accessing_a_contract() {
         contract: "missing.wasm".into(),
         function: "run".into(),
         ramp: "amount".into(),
+        start: 0,
+        step: 1,
         jobs: 1,
         probe_timeout: 0,
         repeat: 1,
@@ -163,7 +169,7 @@ fn run_script_probe(
     executable: &Path,
     scratch: &ProbeScratch,
     args: &LimitsArgs,
-    value: u32,
+    value: i64,
     timeout: Duration,
     verbose: bool,
 ) -> ProbeResult {
@@ -202,6 +208,8 @@ fn fixture_args() -> LimitsArgs {
         contract: "fixture.wasm".into(),
         function: "run".into(),
         ramp: "amount".into(),
+        start: 0,
+        step: 1,
         jobs: 1,
         probe_timeout: 120,
         repeat: 1,

@@ -1230,3 +1230,60 @@ fn ci_enforces_the_feature_boundary_with_a_cargo_tree_policy_check() {
         "CI must keep the library/CLI dependency-boundary check"
     );
 }
+
+#[test]
+fn wasm_target_caches_are_keyed_on_the_exact_rustc_version() {
+    // #413: the nightly job keyed its wasm32v1-none std cache only on
+    // rust-toolchain.toml + Cargo.toml, so the next day's nightly restored
+    // the previous nightly's precompiled `core` and every wasm build failed
+    // with E0514. The stable channel floats too. Every cache of a rustup
+    // target directory must name the compiler in its key and restore
+    // prefix, via the `cachekey` output of the job's toolchain step.
+    let mut checked = 0;
+    for (file, yml) in workflows() {
+        for (job, body) in jobs(&yml) {
+            let lines: Vec<&str> = body.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !(line.trim_start().starts_with("path:") && line.contains("/lib/rustlib/")) {
+                    continue;
+                }
+                checked += 1;
+                let step: Vec<&str> = lines[i..]
+                    .iter()
+                    .take_while(|l| !l.trim_start().starts_with("- "))
+                    .copied()
+                    .collect();
+                let key = step
+                    .iter()
+                    .find(|l| l.trim_start().starts_with("key:"))
+                    .unwrap_or_else(|| panic!("{file} {job}: rustlib cache has no key"));
+                assert!(
+                    key.contains("steps.toolchain.outputs.cachekey"),
+                    "{file} {job}: rustlib cache key must include the rustc version: {key}"
+                );
+                if let Some(pos) = step
+                    .iter()
+                    .position(|l| l.trim_start().starts_with("restore-keys:"))
+                {
+                    for restore in step[pos + 1..]
+                        .iter()
+                        .take_while(|l| !l.contains(':') || l.contains("${{"))
+                    {
+                        assert!(
+                            restore.contains("steps.toolchain.outputs.cachekey"),
+                            "{file} {job}: restore-keys must stay within one rustc version: {restore}"
+                        );
+                    }
+                }
+                assert!(
+                    body.contains("id: toolchain"),
+                    "{file} {job}: the toolchain step needs `id: toolchain` for its cachekey output"
+                );
+            }
+        }
+    }
+    assert!(
+        checked >= 5,
+        "expected the wasm target caches in ci.yml, found {checked}"
+    );
+}

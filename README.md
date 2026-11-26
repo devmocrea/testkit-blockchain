@@ -21,6 +21,185 @@ Soroban contract repo independently rebuilds some subset of:
 
 `soroban-testkit` is that shared layer, as a dev-dependency crate plus a
 small CLI.
+diff --git a/crates/testkit/src/auth/matrix.rs b/crates/testkit/src/auth/matrix.rs
+index 67f9c72..d59a82a 100644
+--- a/crates/testkit/src/auth/matrix.rs
++++ b/crates/testkit/src/auth/matrix.rs
+@@ -18,6 +18,9 @@ struct EntryPointSpec<'a> {
+ /// then call [`AuthMatrix::assert_enforced`] to check that every allowed
+ /// address succeeds and every other address known to the matrix is
+ /// rejected, for every entry point.
++///
++/// A matrix that has nothing to check is a mistake, not a pass: see
++/// [`AuthMatrix::assert_enforced`] for how an empty matrix is handled.
+ pub struct AuthMatrix<'a> {
+     // Ties the matrix's lifetime to its TestEnv; entry point closures
+     // capture their own references into it independently.
+@@ -68,6 +71,33 @@ impl<'a> AuthMatrix<'a> {
+     /// (every cell's expected vs. actual outcome) so a passing cell isn't
+     /// mistaken for a gap in coverage.
+     ///
++    /// # Empty matrices
++    ///
++    /// A matrix with no cells to check fails closed instead of passing
++    /// vacuously. Both cases panic with a [`TestkitError::Misuse`] (code
++    /// `TESTKIT_MISUSE`) *before any entry point closure is called*, so
++    /// nothing is invoked and no state changes:
++    ///
++    /// - **No entry points registered.** Nothing is being tested, which is
++    ///   almost always a forgotten [`AuthMatrix::entry_point`] call.
++    /// - **Entry points registered, but no known callers.** Every entry
++    ///   point was given an empty `allowed` list, so no address is known
++    ///   to the matrix and no (entry point, caller) cell exists. The
++    ///   message names the entry points that were registered.
++    ///
++    /// The second case is checked across the whole matrix, not per entry
++    /// point: an entry point with an empty `allowed` list is still checked
++    /// (every known caller must be rejected) as long as some other entry
++    /// point names at least one allowed address.
++    ///
++    /// ```should_panic(expected = "no entry points")
++    /// use soroban_testkit::auth::AuthMatrix;
++    /// use soroban_testkit::core::TestEnv;
++    ///
++    /// let env = TestEnv::new();
++    /// AuthMatrix::new(&env).assert_enforced();
++    /// ```
++    ///
+     /// # Example
+     ///
+     /// ```
+@@ -108,6 +138,36 @@ impl<'a> AuthMatrix<'a> {
+         }
+         known.sort_by_cached_key(|addr| format!("{addr:?}"));
+ 
++        // An empty matrix has no cells, so the loops below would run zero
++        // iterations and the assertion would pass having checked nothing.
++        // Fail closed, and do it before any entry point closure runs.
++        if entry_points.is_empty() {
++            panic!(
++                "{}",
++                TestkitError::Misuse(
++                    "auth matrix has no entry points registered, so nothing would be \
++                     checked; register at least one with `entry_point` before \
++                     calling `assert_enforced`"
++                        .into()
++                )
++            );
++        }
++        if known.is_empty() {
++            let names: Vec<String> = entry_points
++                .iter()
++                .map(|ep| format!("{:?}", ep.name))
++                .collect();
++            panic!(
++                "{}",
++                TestkitError::Misuse(format!(
++                    "auth matrix has no known callers, so nothing would be checked: \
++                     every `allowed` list is empty on the registered entry point(s) {}; \
++                     name at least one allowed address on some entry point",
++                    names.join(", "),
++                ))
++            );
++        }
++
+         let mut violations = Vec::new();
+         let mut grid = String::new();
+ 
+@@ -376,4 +436,75 @@ mod tests {
+             "entry points should appear in name order: {baseline}"
+         );
+     }
++
++    #[test]
++    fn assert_enforced_panics_when_no_entry_points_are_registered() {
++        let env = TestEnv::new();
++        let message = crate::testing::assert_panics_with_code("TESTKIT_MISUSE", || {
++            AuthMatrix::new(&env).assert_enforced();
++        });
++        assert!(
++            message.contains("no entry points"),
++            "message should say nothing is registered: {message}"
++        );
++    }
++
++    #[test]
++    fn assert_enforced_panics_when_no_caller_is_known_and_calls_nothing() {
++        let env = TestEnv::new();
++        let calls = std::cell::Cell::new(0_usize);
++        let message = crate::testing::assert_panics_with_code("TESTKIT_MISUSE", || {
++            AuthMatrix::new(&env)
++                .entry_point("withdraw", &[], |_c: &Address| {
++                    calls.set(calls.get() + 1);
++                    Ok(())
++                })
++                .assert_enforced();
++        });
++        assert!(
++            message.contains("no known callers"),
++            "message should say no caller is known: {message}"
++        );
++        assert!(
++            message.contains("\"withdraw\""),
++            "message should name the registered entry point: {message}"
++        );
++        assert_eq!(
++            calls.get(),
++            0,
++            "an empty matrix must fail before any entry point closure runs"
++        );
++    }
++
++    #[test]
++    fn no_known_callers_message_lists_every_entry_point_in_name_order() {
++        let env = TestEnv::new();
++        let message = crate::testing::assert_panics_with_code("TESTKIT_MISUSE", || {
++            AuthMatrix::new(&env)
++                .entry_point("zeta", &[], |_c: &Address| Ok(()))
++                .entry_point("alpha", &[], |_c: &Address| Ok(()))
++                .assert_enforced();
++        });
++        let alpha = message.find("\"alpha\"").expect("alpha is named");
++        let zeta = message.find("\"zeta\"").expect("zeta is named");
++        assert!(
++            alpha < zeta,
++            "entry points should be in name order: {message}"
++        );
++    }
++
++    #[test]
++    fn an_empty_allowed_list_is_still_checked_when_another_entry_point_names_a_caller() {
++        // Only the whole-matrix empty case fails closed. Here `owner` is a
++        // known caller via `open`, so `locked` (nobody allowed) is checked
++        // against it: it rejects, which is what the matrix expects.
++        let env = TestEnv::new();
++        let owner = env.address();
++        AuthMatrix::new(&env)
++            .entry_point("open", std::slice::from_ref(&owner), |_c: &Address| Ok(()))
++            .entry_point("locked", &[], |_c: &Address| {
++                Err(soroban_sdk::Error::from_contract_error(1))
++            })
++            .assert_enforced();
++    }
+ }
+diff --git a/crates/testkit/src/auth/mod.rs b/crates/testkit/src/auth/mod.rs
+index 3f4ee14..be14d90 100644
+--- a/crates/testkit/src/auth/mod.rs
++++ b/crates/testkit/src/auth/mod.rs
+@@ -23,6 +23,14 @@
+ //!     })
+ //!     .assert_enforced();
+ //! ```
++//!
++//! # Empty matrices fail closed
++//!
++//! [`AuthMatrix::assert_enforced`] never passes by checking nothing. If no
++//! entry point is registered, or every entry point has an empty `allowed`
++//! list (so no caller is known), it panics with a
++//! [`TestkitError::Misuse`](crate::core::TestkitError::Misuse) before any
++//! entry point closure runs. See the method's `# Empty matrices` section.
+ 
+ mod matrix;
 
 ## For Soroban developers
 
@@ -213,7 +392,10 @@ error: 2 audit finding(s) (--strict)
 
 Every command reports failures the same way: exit status 1 and a single
 `error: <message>` on stderr (clap's own usage errors also start with
-`error:`, but exit 2). Messages say what failed and, where there is one,
+`error:`, but exit 2). The one exception is `audit` invalid input (a PATH that
+is missing or unreadable, or with `--strict` a file that fails to parse),
+which exits 2 so it can be told apart from `--strict` findings (exit 1).
+Messages say what failed and, where there is one,
 the fix; user-supplied names, paths and types are wrapped in backticks,
 and contract types are shown as Rust-like names (`Vec<Address>`), never
 as Rust debug output or a panic backtrace. The conventions live on
@@ -250,6 +432,12 @@ The text report also says explicitly when the search was capped.
 fresh environment, and reports the median with the min and max for each field.
 The JSON `measurements` object carries the same spread. Use it when a contract
 or the host may vary between runs; a single measurement is one sample.
+
+`--start N` (default 0) and `--step N` (default 1) choose the ramp values:
+probes are `start + k*step` for k = 0, 1, 2, 4, and so on. A negative
+`--step` probes downwards, into negative values for signed parameters. Every
+probe must fit the ramp type, so a `u32` ramp cannot go below 0; a `--start`
+or `--step` outside the type's range is refused before any probe runs.
 
 Example:
 
@@ -348,8 +536,13 @@ semantics are outside the current SDK testutils boundary.
 
 `audit` checks source syntax for three local patterns:
 
-- `missing-require-auth`: a function takes an `Address` parameter and its
-  body never calls `require_auth`.
+- `missing-require-auth`: a contract entry point takes an `Address`
+  parameter and its body never calls `require_auth`. Entry points are the
+  `pub fn`s of an `impl` marked `#[contractimpl]` (also spelled
+  `#[soroban_sdk::contractimpl]` or `#[contractimpl(...)]`) and every `fn` of a
+  `#[contractimpl]` trait impl. Free functions and other `impl` blocks are
+  helpers that callers reach through an entry point, so they are not checked
+  for authorization; entry points generated by a macro are not seen.
 - `unchecked-i128-arithmetic`: `+`, `-`, `*`, or `/` on a value typed `i128`
   in the same function, instead of a `checked_`/`saturating_`/`wrapping_`
   method. The finding points at the operator's line, even in a multiline
@@ -377,12 +570,53 @@ An unknown rule name, a rule passed to both flags, or excluding every rule is
 a usage error (exit 2). `--strict` counts only findings from the rules that
 ran, and `--json` lists them in a `rules` field.
 
+Choose which files are audited with `--include` and `--exclude` (repeatable or
+comma-separated), for example to skip generated or vendored code:
+
+```sh
+soroban-testkit audit . --exclude target --exclude '**/generated/**'
+soroban-testkit audit . --include 'contracts/**' --exclude '*_test.rs'
+```
+
+Globs match the same root-relative, `/`-separated paths findings are reported
+under. `*` and `?` stay within one path segment and `**` spans any number of
+segments. As in `.gitignore`, a glob without `/` matches a file or directory
+name at any depth, a glob with `/` is anchored at `PATH`, and a file matches
+when one of its parent directories does. A file is audited when it matches an
+`--include` glob (or none were given) and no `--exclude` glob; excluded
+directories are not read. Filters that leave no `.rs` file to audit are an
+error, so a mistyped glob cannot pass as a clean audit, and they cannot be
+combined with `-` (stdin).
+
+A `.rs` file that is not valid Rust syntax is not audited, but it is not
+silently dropped either: each one is reported as
+`warning: skipped src/gen.rs:3:12: not valid Rust, so it was not audited: ...`
+on stderr, counted in the closing summary, and listed in the `--json`
+document's `skipped` field with its `file`, `line`, `column`, and parser
+`message`. Skipped files do not change the exit status (an editor buffer
+audited through stdin may be mid-edit); exclude known generated templates with
+`--exclude` to silence them.
+
 It does not expand macros, follow calls into helper functions, or replace a
 contract security review, so both false positives and false negatives are
 expected. Unreadable directories abort the audit with an error instead of
 being silently skipped, since skipping one could hide every finding in it.
+Files that cannot be parsed are reported as skipped, as described above.
+
+Symbolic links are not followed below `PATH`. A linked file or directory inside
+the tree is listed as `symlink, not followed` under `--verbose` and is not read, so a link cannot audit the same source under two paths or loop. A `PATH`
+that is itself a symlink is followed, so `soroban-testkit audit linked-crate`
+audits the crate it points at instead of reporting a clean result for zero
+files.
+
 Every run that isn't `--quiet`, including one with no findings, ends with the
 same disclaimer: a missing finding is not a security guarantee.
+
+Exit status: `0` when the scan completes (findings are printed but do not fail
+the run unless `--strict` is passed); `1` when `--strict` is passed and findings
+are reported; `2` for invalid input. A file that fails to parse is skipped with
+a warning on stderr, and `--strict` turns it into invalid input, since a clean
+result would otherwise hide a file nobody checked.
 
 ## Roadmap
 

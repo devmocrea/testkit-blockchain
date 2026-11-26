@@ -6,6 +6,8 @@
 
 pub struct Contract;
 
+// An entry-point block, so `missing-require-auth` applies to its `pub fn`s (#134).
+#[contractimpl]
 impl Contract {
     // missing-require-auth: the nested helper's require_auth
     // authorizes the helper, not `outer`.

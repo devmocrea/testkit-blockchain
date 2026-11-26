@@ -86,6 +86,22 @@ pub struct LimitsArgs {
     /// (ramped as the value) or `Vec<T>` (ramped as its length)
     #[arg(long, value_name = "PARAM", verbatim_doc_comment)]
     ramp: String,
+    /// First ramp value to probe (default 0), within the ramp parameter's type range
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        allow_negative_numbers = true
+    )]
+    start: i64,
+    /// Step between ramp values (default 1; negative probes downwards). Probes are start + k*step for k = 0, 1, 2, 4, ...
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 1,
+        allow_negative_numbers = true
+    )]
+    step: i64,
     // Results are read back in ramp order, so the boundary matches a sequential
     // run. Probes past the first failure are discarded; see BUILD_SPEC.md.
     /// Probe up to N ramp values at once (1 to 8, default 1).
@@ -208,7 +224,7 @@ fn classify_probe_exit(status: ExitStatus) -> ProbeExit {
     }
 }
 
-fn boundary_kind(first_failing: Option<u32>) -> &'static str {
+fn boundary_kind(first_failing: Option<i64>) -> &'static str {
     if first_failing.is_some() {
         "measured_failure"
     } else {
@@ -227,8 +243,8 @@ pub struct ProbeArgs {
     function: String,
     #[arg(long)]
     ramp: String,
-    #[arg(long)]
-    value: u32,
+    #[arg(long, allow_negative_numbers = true)]
+    value: i64,
     #[arg(long = "bool-default", value_name = "PARAM=BOOL", action = clap::ArgAction::Append)]
     bool_defaults: Vec<String>,
     #[arg(long = "auth-mode", value_enum, default_value = "all")]
@@ -302,9 +318,14 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     let (_, env, function, ramp_index) =
         load(&args.contract, &args.function, &args.ramp, args.auth_mode)?;
     validate_bool_defaults(&function, &bool_defaults)?;
-    let preview = build_args(&env, &function, ramp_index, &bool_defaults, 1)?;
+    let (plan, ceiling_index) =
+        ramp_plan(args.start, args.step, &function.inputs[ramp_index].type_)?;
+    let preview = build_args(&env, &function, ramp_index, &bool_defaults, plan.start)?;
     if args.dry_run {
-        println!("probe {}=1 generated arguments: {preview:?}", args.ramp);
+        println!(
+            "probe {}={} generated arguments: {preview:?}",
+            args.ramp, plan.start
+        );
         return Ok(());
     }
     drop(env);
@@ -323,17 +344,19 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
 
     // Runs one batch of probes concurrently, then logs them in ramp order.
     // Returns `None` when the run is cancelled before the batch starts.
-    let mut probe_batch = |values: &[u32]| -> Result<Option<Vec<bool>>, CliError> {
+    // Search indices are converted to ramp values (`plan.value_at`) here, so the
+    // bounds logic below works on indices and only the reports see values.
+    let mut probe_batch = |indices: &[u32]| -> Result<Option<Vec<bool>>, CliError> {
         if CANCELLED.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let results = probe_concurrently(values, |value| {
+        let results = probe_concurrently(indices, |index| {
             run_probe_process(
                 &self_exe,
                 &scratch,
                 &contract,
                 &args,
-                value,
+                plan.value_at(index),
                 Duration::from_secs(args.probe_timeout),
                 out.verbosity == super::output::Verbosity::Verbose,
             )
@@ -341,9 +364,10 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
         if CANCELLED.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let mut outcomes = Vec::with_capacity(values.len());
-        for (value, result) in values.iter().zip(results) {
+        let mut outcomes = Vec::with_capacity(indices.len());
+        for (index, result) in indices.iter().zip(results) {
             let result = result?;
+            let value = plan.value_at(*index);
             out.detail(format!(
                 "probe {}={value}: {}",
                 args.ramp,
@@ -357,7 +381,7 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
             let ok = match result.outcome {
                 ProbeExit::Success => true,
                 ProbeExit::ContractRejected | ProbeExit::HostAborted => {
-                    failure_kinds.insert(*value, result.outcome);
+                    failure_kinds.insert(*index, result.outcome);
                     false
                 }
                 ProbeExit::TimedOut => {
@@ -380,23 +404,25 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     };
 
     // Find a failing upper bound by doubling. A Vec ramp stops at its item cap.
-    let ceiling = ramp_ceiling(&function.inputs[ramp_index].type_);
-    let (ladder_ok, ladder_failed) = match find_ladder_bounds(args.jobs, ceiling, &mut probe_batch)?
-    {
-        Search::Done(bounds) => bounds,
-        Search::Cancelled { last_ok } => return report_interrupted(&args, last_ok),
-    };
+    let (ladder_ok, ladder_failed) =
+        match find_ladder_bounds(args.jobs, ceiling_index, &mut probe_batch)? {
+            Search::Done(bounds) => bounds,
+            Search::Cancelled { last_ok } => {
+                return report_interrupted(&args, last_ok.map(|index| plan.value_at(index)))
+            }
+        };
 
     if CANCELLED.load(Ordering::Relaxed) {
-        return report_interrupted(&args, ladder_ok);
+        return report_interrupted(&args, ladder_ok.map(|index| plan.value_at(index)));
     }
 
     let Some(last_ok) = ladder_ok else {
+        let first = plan.value_at(if ENABLE_ZERO_PROBE { 0 } else { 1 });
         return Err(CliError(format!(
-            "{} failed even at the smallest ramp value ({}) for parameter {}; check that \
-             the function succeeds with default arguments (run with --verbose to see each probe)",
+            "{} failed even at the smallest ramp value ({first}) for parameter {}; check that \
+             the function succeeds with default arguments (run with --verbose to see each probe), \
+             or pass --start with a value it accepts",
             quote(&args.function),
-            if ENABLE_ZERO_PROBE { 0 } else { 1 },
             quote(&args.ramp)
         )));
     };
@@ -407,32 +433,45 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     if let Some(hi_start) = ladder_failed {
         best = match refine_boundary(last_ok, hi_start, args.jobs, &mut probe_batch)? {
             Search::Done(boundary) => boundary,
-            Search::Cancelled { last_ok } => return report_interrupted(&args, last_ok),
+            Search::Cancelled { last_ok } => {
+                return report_interrupted(&args, last_ok.map(|index| plan.value_at(index)))
+            }
         };
 
         // Monotonicity sampling (issue #186) after refinement
-        if !CANCELLED.load(Ordering::Relaxed) {
-            sample_monotonicity(best, hi_start, 3, &mut probe_batch)?;
+        if !CANCELLED.load(Ordering::Relaxed)
+            && !sample_monotonicity(best, hi_start, 3, &mut probe_batch)?
+        {
+            eprintln!(
+                "warning: potential non-monotonic behavior detected: {} failed between known-success {} and known-failure {}",
+                args.ramp,
+                plan.value_at(best),
+                plan.value_at(hi_start)
+            );
         }
     }
 
     if CANCELLED.load(Ordering::Relaxed) {
-        return report_interrupted(&args, Some(best));
+        return report_interrupted(&args, Some(plan.value_at(best)));
     }
 
-    // A cap without an observed failure is not a proven maximum.
-    let first_failing = ladder_failed.map(|_| best + 1);
+    // A cap without an observed failure is not a proven maximum. Failures are
+    // keyed by search index; the reports below use ramp values.
+    let first_failing_index = ladder_failed.map(|_| best + 1);
     let failure_kind =
-        first_failing.and_then(|value| failure_kinds.get(&value).map(ProbeExit::label));
+        first_failing_index.and_then(|index| failure_kinds.get(&index).map(ProbeExit::label));
+    let first_failing = first_failing_index.map(|index| plan.value_at(index));
+    let best_value = plan.value_at(best);
+    let ceiling = plan.value_at(ceiling_index);
 
     // Revalidate the boundary (issue #185) before final measurement
     let (contract_id, env, func_spec, ramp_index) =
         load(&args.contract, &args.function, &args.ramp, args.auth_mode)?;
     let func = Symbol::new(&env, &args.function);
-    let revalidation_args = build_args(&env, &func_spec, ramp_index, &bool_defaults, best)?;
+    let revalidation_args = build_args(&env, &func_spec, ramp_index, &bool_defaults, best_value)?;
     if !invoke_succeeds(&env, &contract_id, &func, revalidation_args) {
         out.note(format!(
-            "warning: boundary revalidation failed for {} = {best}; this may indicate \
+            "warning: boundary revalidation failed for {} = {best_value}; this may indicate \
              nondeterministic contract behavior. consider running limits again.",
             args.ramp
         ));
@@ -445,7 +484,7 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     let mut cpu_samples = Vec::with_capacity(args.repeat);
     let mut memory_samples = Vec::with_capacity(args.repeat);
     for _ in 0..args.repeat {
-        let (instructions, memory_bytes) = measure(&args, best, &bool_defaults)?;
+        let (instructions, memory_bytes) = measure(&args, best_value, &bool_defaults)?;
         cpu_samples.push(instructions);
         memory_samples.push(memory_bytes);
     }
@@ -455,14 +494,14 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
     };
     // For a Vec ramp, the ramp value is the number of items generated.
     let generated_items =
-        matches!(function.inputs[ramp_index].type_, ScSpecTypeDef::Vec(_)).then_some(best);
+        matches!(function.inputs[ramp_index].type_, ScSpecTypeDef::Vec(_)).then_some(best_value);
 
     if args.json {
         println!(
             "{}",
             render_json(
                 &args,
-                best,
+                best_value,
                 &measured,
                 first_failing,
                 failure_kind,
@@ -480,7 +519,7 @@ pub fn run(args: LimitsArgs, out: Output) -> Result<(), CliError> {
         ""
     };
     println!(
-        "last successful {} for {:?}: {best}{unit}",
+        "last successful {} for {:?}: {best_value}{unit}",
         args.ramp, args.function
     );
     println!("  instructions: {}", measured.instructions.describe());
@@ -551,12 +590,12 @@ struct Measured {
 /// `generated_items` is set only for a `Vec` ramp.
 fn render_json(
     args: &LimitsArgs,
-    best: u32,
+    best: i64,
     measured: &Measured,
-    first_failing: Option<u32>,
+    first_failing: Option<i64>,
     failure_kind: Option<&str>,
-    ceiling: u32,
-    generated_items: Option<u32>,
+    ceiling: i64,
+    generated_items: Option<i64>,
 ) -> String {
     serde_json::json!({
         "schema_version": LIMITS_JSON_SCHEMA_VERSION,
@@ -710,7 +749,7 @@ fn run_probe_process(
     scratch: &ProbeScratch,
     contract: &Path,
     args: &LimitsArgs,
-    value: u32,
+    value: i64,
     timeout: Duration,
     verbose: bool,
 ) -> ProbeResult {
@@ -950,22 +989,13 @@ where
 
     // Check for monotonicity: all points between lo and hi should succeed
     // since lo is a known success. If any fail, there's non-monotonic behavior.
-    for (sample, &ok) in samples.iter().zip(&results) {
-        if !ok {
-            eprintln!(
-                "warning: potential non-monotonic behavior detected: \
-                 value {} failed but is between known-success {} and known-failure {}",
-                sample, lo, hi
-            );
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    // The caller reports it, because it knows the ramp values behind the indices.
+    Ok(results.iter().all(|&ok| ok))
 }
 
 /// A cancelled run reports its last successful probe without claiming
 /// a proven maximum or attempting a fresh WASM invocation.
-fn report_interrupted(args: &LimitsArgs, last_ok: Option<u32>) -> Result<(), CliError> {
+fn report_interrupted(args: &LimitsArgs, last_ok: Option<i64>) -> Result<(), CliError> {
     match last_ok {
         Some(value) => {
             println!("interrupted; last successful {} for {:?}: {value} (partial result, not a proven maximum)", args.ramp, args.function);
@@ -1001,7 +1031,7 @@ pub fn run_probe(args: ProbeArgs) -> Result<bool, CliError> {
 
 fn measure(
     args: &LimitsArgs,
-    value: u32,
+    value: i64,
     bool_defaults: &BTreeMap<String, bool>,
 ) -> Result<(u64, u64), CliError> {
     let (contract_id, env, function, ramp_index) =
@@ -1292,7 +1322,7 @@ fn build_args(
     function: &ScSpecFunctionV0,
     ramp_index: usize,
     bool_defaults: &BTreeMap<String, bool>,
-    ramp_value: u32,
+    ramp_value: i64,
 ) -> Result<SVec<Val>, CliError> {
     let admin = Address::generate(env);
     let mut vals = SVec::new(env);
@@ -1326,20 +1356,25 @@ fn invoke_succeeds(env: &Env, contract_id: &Address, func: &Symbol, args: SVec<V
     )
 }
 
-fn ramp_val(env: &Env, type_: &ScSpecTypeDef, ramp_value: u32) -> Result<Val, CliError> {
+fn ramp_val(env: &Env, type_: &ScSpecTypeDef, ramp_value: i64) -> Result<Val, CliError> {
     match type_ {
-        ScSpecTypeDef::U32 => Ok(ramp_value.into_val(env)),
-        ScSpecTypeDef::I32 => Ok((ramp_value as i32).into_val(env)),
-        ScSpecTypeDef::U64 => Ok((ramp_value as u64).into_val(env)),
-        ScSpecTypeDef::I64 => Ok((ramp_value as i64).into_val(env)),
-        ScSpecTypeDef::U128 => Ok((ramp_value as u128).into_val(env)),
-        ScSpecTypeDef::I128 => Ok((ramp_value as i128).into_val(env)),
+        ScSpecTypeDef::U32 => Ok(ramp_int::<u32>(ramp_value, type_)?.into_val(env)),
+        ScSpecTypeDef::I32 => Ok(ramp_int::<i32>(ramp_value, type_)?.into_val(env)),
+        ScSpecTypeDef::U64 => Ok(ramp_int::<u64>(ramp_value, type_)?.into_val(env)),
+        ScSpecTypeDef::I64 => Ok(ramp_int::<i64>(ramp_value, type_)?.into_val(env)),
+        ScSpecTypeDef::U128 => Ok(ramp_int::<u128>(ramp_value, type_)?.into_val(env)),
+        ScSpecTypeDef::I128 => Ok(ramp_int::<i128>(ramp_value, type_)?.into_val(env)),
         ScSpecTypeDef::Vec(inner) => {
             let element = &inner.element_type;
             // Checked before the loop, so an unsupported element type is
             // rejected even when the ramp value is 0.
             ramp_item(env, element)?;
-            if ramp_value > MAX_VEC_RAMP_ITEMS {
+            if ramp_value < 0 {
+                return Err(CliError(format!(
+                    "a Vec ramp cannot generate {ramp_value} items; use a --start of 0 or more"
+                )));
+            }
+            if ramp_value > i64::from(MAX_VEC_RAMP_ITEMS) {
                 return Err(CliError(format!(
                     "a Vec ramp generates at most {MAX_VEC_RAMP_ITEMS} items; refusing {ramp_value}"
                 )));
@@ -1354,13 +1389,85 @@ fn ramp_val(env: &Env, type_: &ScSpecTypeDef, ramp_value: u32) -> Result<Val, Cl
     }
 }
 
-/// The largest ramp value the search may try for a parameter of this type. A
-/// `Vec` is capped at [`MAX_VEC_RAMP_ITEMS`]; integers use [`SEARCH_CEILING`].
-fn ramp_ceiling(type_: &ScSpecTypeDef) -> u32 {
-    match type_ {
-        ScSpecTypeDef::Vec(_) => MAX_VEC_RAMP_ITEMS,
-        _ => SEARCH_CEILING,
+/// Where a ramp search starts and how far apart its values are. Search index
+/// `k` probes the ramp value `start + k * step`. The search doubles `k` (0, 1,
+/// 2, 4, ...), so the probes are start, start + step, start + 2 * step,
+/// start + 4 * step, and so on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RampPlan {
+    start: i64,
+    step: i64,
+}
+
+impl RampPlan {
+    fn value_at(self, index: u32) -> i64 {
+        self.start + i64::from(index) * self.step
     }
+
+    /// The largest index whose value stays within `lo..=hi`. `start` must
+    /// already lie in that range, and `step` must not be 0.
+    fn max_index(self, lo: i64, hi: i64) -> u32 {
+        let steps = if self.step > 0 {
+            (hi - self.start) / self.step
+        } else {
+            (self.start - lo) / -self.step
+        };
+        u32::try_from(steps).unwrap_or(u32::MAX)
+    }
+}
+
+/// The inclusive range of ramp values a search may probe for `type_`: the
+/// type's own range, limited to [`SEARCH_CEILING`] in magnitude, or
+/// `0..=MAX_VEC_RAMP_ITEMS` for a `Vec`.
+fn ramp_limits(type_: &ScSpecTypeDef) -> Result<(i64, i64), CliError> {
+    let cap = i64::from(SEARCH_CEILING);
+    let (lo, hi) = match type_ {
+        ScSpecTypeDef::Vec(_) => return Ok((0, i64::from(MAX_VEC_RAMP_ITEMS))),
+        ScSpecTypeDef::U32 => (0, i64::from(u32::MAX)),
+        ScSpecTypeDef::I32 => (i64::from(i32::MIN), i64::from(i32::MAX)),
+        // 64-bit and 128-bit ramps are limited to i64 here, which the search cap
+        // is well inside.
+        ScSpecTypeDef::U64 | ScSpecTypeDef::U128 => (0, i64::MAX),
+        ScSpecTypeDef::I64 | ScSpecTypeDef::I128 => (i64::MIN, i64::MAX),
+        other => return Err(unsupported_ramp_type(other)),
+    };
+    Ok((lo.max(-cap), hi.min(cap)))
+}
+
+/// Checks `--start` and `--step` against the ramp parameter's type. Returns
+/// the search plan and the largest search index it may use.
+fn ramp_plan(start: i64, step: i64, type_: &ScSpecTypeDef) -> Result<(RampPlan, u32), CliError> {
+    let (lo, hi) = ramp_limits(type_)?;
+    let ty = quote(type_name(type_));
+    if !(lo..=hi).contains(&start) {
+        return Err(CliError(format!(
+            "--start {start} is outside the values a {ty} ramp can take ({lo} to {hi})"
+        )));
+    }
+    if step == 0 {
+        return Err(CliError(
+            "--step must not be 0; use a negative value to probe downwards".to_string(),
+        ));
+    }
+    if step.unsigned_abs() > (hi - lo).unsigned_abs() {
+        return Err(CliError(format!(
+            "--step {step} is larger than the range of a {ty} ramp ({lo} to {hi})"
+        )));
+    }
+    let plan = RampPlan { start, step };
+    Ok((plan, plan.max_index(lo, hi)))
+}
+
+/// Converts a ramp value to the integer type `type_` names, refusing a value
+/// that type cannot hold (for example a negative value for `u32`).
+fn ramp_int<T: TryFrom<i64>>(value: i64, type_: &ScSpecTypeDef) -> Result<T, CliError> {
+    T::try_from(value).map_err(|_| {
+        CliError(format!(
+            "ramp value {value} is outside the range of {}; choose a --start and --step \
+             that stay within it",
+            quote(type_name(type_))
+        ))
+    })
 }
 
 /// One item of a ramped `Vec`. Addresses are distinct; every other element
@@ -1634,7 +1741,10 @@ mod tests {
         let result = find_ladder_bounds(4, SEARCH_CEILING, threshold_probe(u32::MAX)).unwrap();
         assert_eq!(result, Search::Done((Some(SEARCH_CEILING), None)));
         assert_eq!(boundary_kind(None), "search_cap_reached");
-        assert_eq!(boundary_kind(Some(SEARCH_CEILING)), "measured_failure");
+        assert_eq!(
+            boundary_kind(Some(i64::from(SEARCH_CEILING))),
+            "measured_failure"
+        );
     }
 
     #[test]
@@ -1744,6 +1854,8 @@ mod tests {
                 contract: "missing.wasm".into(),
                 function: "run".into(),
                 ramp: "amount".into(),
+                start: 0,
+                step: 1,
                 jobs,
                 probe_timeout: 120,
                 repeat: 1,
@@ -1770,6 +1882,8 @@ mod tests {
             contract: "test.wasm".into(),
             function: "run".into(),
             ramp: "amount".into(),
+            start: 0,
+            step: 1,
             jobs: 1,
             probe_timeout: 120,
             repeat: 1,
@@ -2209,7 +2323,7 @@ mod tests {
 
         let env = Env::default();
         let addresses = vec_of(ScSpecTypeDef::Address);
-        let decode = |ramp: u32| {
+        let decode = |ramp: i64| {
             let val = ramp_val(&env, &addresses, ramp).unwrap();
             SVec::<Address>::try_from_val(&env, &val).unwrap()
         };
@@ -2225,11 +2339,21 @@ mod tests {
         );
 
         // The cap is inclusive; one more item is refused before any is generated.
-        assert_eq!(decode(MAX_VEC_RAMP_ITEMS).len(), MAX_VEC_RAMP_ITEMS);
-        let err = ramp_val(&env, &addresses, MAX_VEC_RAMP_ITEMS + 1).expect_err("above the cap");
+        assert_eq!(
+            decode(i64::from(MAX_VEC_RAMP_ITEMS)).len(),
+            MAX_VEC_RAMP_ITEMS
+        );
+        let err = ramp_val(&env, &addresses, i64::from(MAX_VEC_RAMP_ITEMS) + 1)
+            .expect_err("above the cap");
         assert!(err.0.contains("at most 1024 items"), "{err}");
-        assert_eq!(ramp_ceiling(&addresses), MAX_VEC_RAMP_ITEMS);
-        assert_eq!(ramp_ceiling(&ScSpecTypeDef::U32), SEARCH_CEILING);
+        assert_eq!(
+            ramp_limits(&addresses).unwrap(),
+            (0, i64::from(MAX_VEC_RAMP_ITEMS))
+        );
+        assert_eq!(
+            ramp_limits(&ScSpecTypeDef::U32).unwrap(),
+            (0, i64::from(SEARCH_CEILING))
+        );
     }
 
     #[test]
@@ -2252,6 +2376,91 @@ mod tests {
         assert_no_debug_output(&err);
     }
 
+    /// Runs the ladder and refinement for `plan` over search indices, where a
+    /// ramp value succeeds when `ok` holds, and returns the boundary value.
+    fn boundary_value(plan: RampPlan, ceiling: u32, ok: impl Fn(i64) -> bool) -> Option<i64> {
+        let mut probe = |indices: &[u32]| -> Result<Option<Vec<bool>>, CliError> {
+            Ok(Some(
+                indices
+                    .iter()
+                    .map(|&index| ok(plan.value_at(index)))
+                    .collect(),
+            ))
+        };
+        let (last_ok, first_failed) = match find_ladder_bounds(4, ceiling, &mut probe).unwrap() {
+            Search::Done(bounds) => bounds,
+            Search::Cancelled { .. } => unreachable!("no cancellation in this test"),
+        };
+        let last_ok = last_ok?;
+        let Some(hi) = first_failed else {
+            return Some(plan.value_at(last_ok));
+        };
+        match refine_boundary(last_ok, hi, 4, &mut probe).unwrap() {
+            Search::Done(boundary) => Some(plan.value_at(boundary)),
+            Search::Cancelled { .. } => unreachable!("no cancellation in this test"),
+        }
+    }
+
+    #[test]
+    fn a_custom_start_probes_from_that_value_and_reports_values() {
+        // Values are 40 + index, so successes are the values up to 1000.
+        let (plan, ceiling) = ramp_plan(40, 1, &ScSpecTypeDef::U32).unwrap();
+        assert_eq!(plan.value_at(0), 40);
+        assert_eq!(plan.value_at(4), 44);
+        assert_eq!(
+            boundary_value(plan, ceiling, |value| value <= 1000),
+            Some(1000)
+        );
+        // A start that already fails leaves no successful value.
+        assert_eq!(boundary_value(plan, ceiling, |value| value < 40), None);
+    }
+
+    #[test]
+    fn a_negative_step_probes_downwards_into_negative_values() {
+        // An i32 ramp from 0 stepping by -1 succeeds while the value stays >= -300.
+        let (plan, ceiling) = ramp_plan(0, -1, &ScSpecTypeDef::I32).unwrap();
+        assert_eq!(plan.value_at(4), -4);
+        assert_eq!(
+            boundary_value(plan, ceiling, |value| value >= -300),
+            Some(-300)
+        );
+    }
+
+    #[test]
+    fn start_and_step_are_checked_against_the_ramp_type() {
+        let vec_ramp = vec_of(ScSpecTypeDef::Address);
+        let outside = ramp_plan(-1, 1, &ScSpecTypeDef::U32).unwrap_err();
+        assert!(
+            outside
+                .0
+                .contains("--start -1 is outside the values a `u32` ramp can take (0 to 16777216)"),
+            "{outside}"
+        );
+        let zero_step = ramp_plan(0, 0, &ScSpecTypeDef::U32).unwrap_err();
+        assert!(zero_step.0.contains("--step must not be 0"), "{zero_step}");
+        let too_long = ramp_plan(0, 2000, &vec_ramp).unwrap_err();
+        assert!(
+            too_long.0.contains(
+                "--step 2000 is larger than the range of a `Vec<Address>` ramp (0 to 1024)"
+            ),
+            "{too_long}"
+        );
+        assert!(ramp_plan(0, 2, &vec_ramp).is_ok());
+    }
+
+    #[test]
+    fn ramp_values_the_type_cannot_hold_are_refused_with_the_type_named() {
+        let env = Env::default();
+        let err = ramp_val(&env, &ScSpecTypeDef::U32, -1).expect_err("u32 cannot be negative");
+        assert!(
+            err.0
+                .contains("ramp value -1 is outside the range of `u32`"),
+            "{err}"
+        );
+        assert!(ramp_val(&env, &ScSpecTypeDef::I32, -1).is_ok());
+        assert!(ramp_val(&env, &vec_of(ScSpecTypeDef::Address), -1).is_err());
+    }
+
     #[test]
     fn repeat_samples_summarize_with_a_lower_median() {
         let odd = Spread::of(vec![9, 3, 5]);
@@ -2272,6 +2481,8 @@ mod tests {
                 contract: "missing.wasm".into(),
                 function: "run".into(),
                 ramp: "amount".into(),
+                start: 0,
+                step: 1,
                 jobs: 1,
                 probe_timeout: 120,
                 repeat,

@@ -122,6 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
         with:
           # wasm32v1-none is needed by the CLI's integration tests, which
           # build examples/vault to a real .wasm to test `limits` against.
@@ -130,9 +131,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.rustup/toolchains/*/lib/rustlib/wasm32v1-none
-          key: wasm32v1-none-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
+          # Key on the exact compiler (the toolchain step's rustc-version
+          # hash), never just on rust-toolchain.toml: the channel floats, and
+          # restoring a std built by another rustc fails every wasm build with
+          # E0514 (#413). restore-keys stays within the same compiler.
+          key: wasm32v1-none-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
           restore-keys: |
-            wasm32v1-none-${{ runner.os }}-
+            wasm32v1-none-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
       - run: cargo test --workspace
@@ -164,15 +169,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
         with:
           targets: wasm32v1-none
       - name: Cache wasm target
         uses: actions/cache@v4
         with:
           path: ~/.rustup/toolchains/*/lib/rustlib/wasm32v1-none
-          key: wasm32v1-none-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
+          # Key on the exact compiler (the toolchain step's rustc-version
+          # hash), never just on rust-toolchain.toml: the channel floats, and
+          # restoring a std built by another rustc fails every wasm build with
+          # E0514 (#413). restore-keys stays within the same compiler.
+          key: wasm32v1-none-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
           restore-keys: |
-            wasm32v1-none-${{ runner.os }}-
+            wasm32v1-none-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-
       - uses: Swatinem/rust-cache@v2
       - name: Build all examples
         run: cargo build --examples --target wasm32v1-none --release
@@ -286,15 +296,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
         with:
           targets: wasm32v1-none
       - name: Cache wasm target
         uses: actions/cache@v4
         with:
           path: ~/.rustup/toolchains/*/lib/rustlib/wasm32v1-none
-          key: wasm32v1-none-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
+          # Key on the exact compiler (the toolchain step's rustc-version
+          # hash), never just on rust-toolchain.toml: the channel floats, and
+          # restoring a std built by another rustc fails every wasm build with
+          # E0514 (#413). restore-keys stays within the same compiler.
+          key: wasm32v1-none-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
           restore-keys: |
-            wasm32v1-none-${{ runner.os }}-
+            wasm32v1-none-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --workspace --all-targets --lcov --output-path lcov.info
@@ -321,15 +336,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
         with:
           targets: wasm32v1-none
       - name: Cache wasm target
         uses: actions/cache@v4
         with:
           path: ~/.rustup/toolchains/*/lib/rustlib/wasm32v1-none
-          key: wasm32v1-none-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
+          # Key on the exact compiler (the toolchain step's rustc-version
+          # hash), never just on rust-toolchain.toml: the channel floats, and
+          # restoring a std built by another rustc fails every wasm build with
+          # E0514 (#413). restore-keys stays within the same compiler.
+          key: wasm32v1-none-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
           restore-keys: |
-            wasm32v1-none-${{ runner.os }}-
+            wasm32v1-none-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-
       - uses: Swatinem/rust-cache@v2
       - name: Update soroban-sdk to the latest stable release
         run: cargo update -p soroban-sdk
@@ -385,6 +405,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        id: toolchain
         with:
           targets: wasm32v1-none
           # rust-src is required for building core/alloc when cross-compiling
@@ -395,9 +416,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.rustup/toolchains/nightly-*/lib/rustlib/wasm32v1-none
-          key: wasm32v1-none-nightly-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
+          # Nightly changes daily, so the key must name the exact nightly
+          # (the toolchain step's rustc-version hash). Keying only on
+          # rust-toolchain.toml restored yesterday's std over today's
+          # compiler and broke every wasm build with E0514 (#413).
+          key: wasm32v1-none-nightly-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
           restore-keys: |
-            wasm32v1-none-nightly-${{ runner.os }}-
+            wasm32v1-none-nightly-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-
       - uses: Swatinem/rust-cache@v2
       - run: cargo +nightly build --workspace
       - run: cargo +nightly test --workspace
