@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand};
     after_help = "EXIT STATUS:\n    \
     0  success\n    \
     1  the command failed; the reason is printed on stderr as `error: ...`\n    \
-    2  invalid usage (unknown flag, missing argument, ...)\n\n\
+    2  invalid usage (unknown flag, missing argument, ...) or invalid audit input\n\n\
 ENVIRONMENT:\n    \
     NO_COLOR  a non-empty value has the same effect as --no-color\n\n\
 Run `soroban-testkit <COMMAND> --help` for each command's defaults and limitations."
@@ -97,9 +97,11 @@ pub enum Commands {
     /// These are syntactic heuristics: findings can be false positives, and
     /// no findings does not mean a contract is secure. Files that fail to
     /// parse are not audited; each is listed with its parse error (as a
-    /// warning on stderr, or in the JSON `skipped` field). Findings and
-    /// skipped files exit 0 unless --strict is passed, which fails on
-    /// findings only.
+    /// warning on stderr, or in the JSON `skipped` field).
+    ///
+    /// Exit status: 0 when the scan completes; 1 when --strict is passed and
+    /// findings are reported; 2 for invalid input, which is a PATH that is
+    /// missing or unreadable, or, with --strict, a file that fails to parse.
     #[command(verbatim_doc_comment)]
     Audit(audit::AuditArgs),
     /// Hidden: runs a single limits probe in its own process. See

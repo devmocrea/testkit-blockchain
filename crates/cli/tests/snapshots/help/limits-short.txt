@@ -13,6 +13,8 @@ Options:
       --ramp <PARAM>               The parameter of --fn to increase on each attempt: an integer type
                                    (ramped as the value) or `Vec<T>` (ramped as its length)
   -v, --verbose                    Print extra diagnostics (commands run, files scanned) to stderr
+      --start <N>                  First ramp value to probe (default 0), within the ramp parameter's type range [default: 0]
+      --step <N>                   Step between ramp values (default 1; negative probes downwards). Probes are start + k*step for k = 0, 1, 2, 4, ... [default: 1]
       --jobs <N>                   Probe up to N ramp values at once (1 to 8, default 1) [default: 1]
       --probe-timeout <SECONDS>    Stop an individual probe after N seconds (default 120; minimum 1) [default: 120]
       --repeat <N>                 Measure the final value N times (1 to 16, default 1). With N above 1, the report gives the median with the min and max [default: 1]

@@ -1,14 +1,18 @@
 Find the largest input a contract function handles before it fails
 
 Invokes --fn on the compiled .wasm in a local Soroban host (no
-network), increasing the --ramp parameter: doubling from 0 (then 1,
-2, 4, ...) until a call fails, then binary-searching between the last
-success and the first failure. Each attempt runs in its own
-subprocess. Values above 16777216 (2^24) are not tried, and a Vec ramp
-stops at 1024 items. Prints the last successful value with the CPU
-instructions and memory bytes it used.
+network), increasing the --ramp parameter: from --start (default 0) it
+probes --start plus k times --step for k = 0, 1, 2, 4, ..., until a call
+fails, then binary-searches between the last success and the first
+failure. Each attempt runs in its own subprocess. Values above 16777216
+(2^24) in magnitude are not tried, and a Vec ramp stops at 1024 items.
+Prints the last successful value with the CPU instructions and memory
+bytes it used.
 
 Limitations:
+  - --start and --step must keep every probe inside the ramp type: a
+    u32 ramp cannot go below 0, and --step cannot exceed the type's range.
+    A negative --step probes downwards, into negative values.
   - --ramp accepts u32/i32/u64/i64/u128/i128 (ramped as the value) and
     `Vec<T>` (ramped as its length), where T is Address, bool, an
     integer, Symbol, String or Bytes. Each `Vec<Address>` item is a
@@ -54,6 +58,16 @@ Options:
 
   -v, --verbose
           Print extra diagnostics (commands run, files scanned) to stderr
+
+      --start <N>
+          First ramp value to probe (default 0), within the ramp parameter's type range
+          
+          [default: 0]
+
+      --step <N>
+          Step between ramp values (default 1; negative probes downwards). Probes are start + k*step for k = 0, 1, 2, 4, ...
+          
+          [default: 1]
 
       --jobs <N>
           Probe up to N ramp values at once (1 to 8, default 1)

@@ -1,10 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 use proc_macro2::Span;
-use quote::ToTokens;
 use syn::visit::{self, Visit};
 use syn::{
     Attribute, BinOp, Expr, FnArg, ImplItemFn, Item, ItemFn, ItemImpl, Local, Pat, Signature, Type,
@@ -31,8 +30,8 @@ pub struct AuditArgs {
     /// (for editor integrations that audit unsaved buffers)
     #[arg(value_name = "PATH", default_value = ".", verbatim_doc_comment)]
     path: PathBuf,
-    /// Exit 1 if any findings are reported. Without it, findings are
-    /// printed and the command still exits 0
+    /// Exit 1 if any findings are reported, or 2 if a file failed to parse.
+    /// Without it, findings are printed and the command still exits 0
     #[arg(long, verbatim_doc_comment)]
     strict: bool,
     /// Print findings as a JSON document (`schema_version` 1) on stdout
@@ -294,6 +293,22 @@ struct Skipped {
     message: String,
 }
 
+/// Exit status for `audit` when its input could not be audited: a PATH that is
+/// missing or unreadable, or, with `--strict`, a file that fails to parse. See
+/// `EXIT STATUS` in `--help`.
+pub const INVALID_INPUT_EXIT_CODE: i32 = 2;
+
+/// How an `audit` run that read its input ended. Invalid input is an error,
+/// not a status (see [`run`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuditStatus {
+    /// The scan completed. Findings, if any, do not fail the run unless
+    /// `--strict` is passed.
+    Pass,
+    /// `--strict` was passed and this many findings were reported.
+    StrictFindings(usize),
+}
+
 #[derive(Debug)]
 struct Finding {
     /// See [`finding_path`].
@@ -309,6 +324,7 @@ struct Finding {
 /// capable of missing real bugs or flagging non-bugs. The absence of a
 /// finding here is never a security guarantee.
 ///
+ fix/audit-136-138-139
 /// 1. Contract entry points taking an `Address` parameter that never call
 ///    `require_auth` anywhere in the function body. An entry point is a
 ///    `pub fn` in an `impl` block marked `#[contractimpl]`, or any fn of a
@@ -319,15 +335,35 @@ struct Finding {
 ///    `checked_`/`saturating_`/`wrapping_` call. The finding points at the
 ///    operator's line, so multiline expressions identify the exact
 ///    arithmetic source location.
+
+/// 1. Contract entry points taking an `Address` parameter (including references,
+///    fully qualified paths like `soroban_sdk::Address`, and type or import
+///    aliases) that never call `require_auth` anywhere in the function body or
+///    in delegated helper functions. An entry point is a `pub fn` in an `impl`
+///    block marked `#[contractimpl]`, or any fn of a `#[contractimpl]` trait
+///    impl; free functions and helper `impl`s are not entry points (see
+///    [`EntryPoints`]). Intentional open entry points can suppress this rule
+///    with `#[allow(soroban_testkit::missing_require_auth)]` (or
+///    `#[allow(missing_require_auth)]`).
+/// 2. Arithmetic (`+ - * /`) on an `i128`-typed binding (following references
+///    and simple aliases), done outside a `checked_`/`saturating_`/`wrapping_`
+///    call. The finding points at the operator's line, so multiline expressions
+///    identify the exact arithmetic source location.
+ main
 /// 3. A `.persistent()`/`.temporary()` storage read with no
 ///    `.extend_ttl(` call anywhere in the same function.
 ///
 /// Finding paths are relative to the audited `PATH` and `/`-separated (see
 /// [`finding_path`]), so the same crate reports the same paths whichever
 /// directory the command runs from. `--include`/`--exclude` globs match
-/// those same paths (see [`PathFilter`]). Files that do not parse are
+/// those same paths (see [`PathFilter`]). Symbolic links below `PATH` are
+/// not followed (see [`collect_sources`]). Files that do not parse are
 /// listed as skipped, with the parser's position and message.
-pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
+///
+/// A finding's line is the line of its function's `fn` keyword, or of the
+/// operator for arithmetic, so a doc comment or attribute above a function
+/// never moves the reported line.
+pub fn run(args: AuditArgs, out: Output) -> Result<AuditStatus, CliError> {
     let rules =
         selected_rules(&args.rules, &args.exclude_rules).unwrap_or_else(|msg| usage_error(msg));
     let all_rules = rules.len() == Rule::ALL.len();
@@ -360,56 +396,22 @@ pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
                 super::quote(args.path.display())
             ))
         })?;
-        let mut filtered_out = 0usize;
-        let mut audited = 0usize;
-        let walker = WalkDir::new(&args.path).into_iter().filter_entry(|entry| {
-            // Prune excluded directories so vendored or generated trees are
-            // never read. The root itself is always walked.
-            if entry.depth() == 0 || !entry.file_type().is_dir() {
-                return true;
-            }
-            let keep = !filter.excludes(&finding_path(&args.path, entry.path()));
-            if !keep {
-                out.detail(format!("skipping {} (--exclude)", entry.path().display()));
-            }
-            keep
-        });
-        for entry in walker {
-            // A traversal error means at least one .rs file may never be
-            // examined, so stop instead of reporting a misleading clean audit.
-            let entry = entry.map_err(|err| traversal_error(&args.path, &err))?;
-            // Skip symlinks: audit only follows the real filesystem structure for
-            // deterministic results (symlinks can create cycles, loops, or
-            // inaccessible paths depending on the platform and permissions).
-            if entry.path_is_symlink() {
-                continue;
-            }
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if entry.path().extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let display = finding_path(&args.path, entry.path());
-            if !filter.selects(&display) {
-                filtered_out += 1;
-                out.detail(format!(
-                    "skipping {} (--include/--exclude)",
-                    entry.path().display()
-                ));
-                continue;
-            }
-            out.detail(format!("scanning {}", entry.path().display()));
-            audited += 1;
-            audit_file(entry.path(), &display, &rules, &mut findings, &mut skipped)?;
+        let collection = collect_sources(&args.path, &filter)?;
+        for (path, reason) in &collection.skipped {
+            out.detail(format!("skipping {} ({reason})", path.display()));
+        }
+        for (path, display) in &collection.files {
+            out.detail(format!("scanning {}", path.display()));
+            audit_file(path, display, &rules, &mut findings, &mut skipped)?;
         }
         // A pattern typo would otherwise "pass" with no findings, like a
         // typo'd PATH, so filtering out every .rs file is an error.
-        if audited == 0 && filtered_out > 0 {
+        if collection.files.is_empty() && collection.filtered_out > 0 {
             return Err(CliError(format!(
-                "no .rs file under {} matches --include/--exclude ({filtered_out} filtered out); \
+                "no .rs file under {} matches --include/--exclude ({} filtered out); \
                  check the glob patterns",
-                super::quote(args.path.display())
+                super::quote(args.path.display()),
+                collection.filtered_out
             )));
         }
     }
@@ -423,6 +425,17 @@ pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
                 skip.file, skip.line, skip.column, skip.message
             );
         }
+    }
+    // A file that does not parse is not audited. Without --strict it is
+    // reported above and the run goes on. With --strict the run is invalid
+    // input, because a clean result would hide a file nobody checked.
+    if args.strict && !skipped.is_empty() {
+        let files: Vec<&str> = skipped.iter().map(|skip| skip.file.as_str()).collect();
+        return Err(CliError(format!(
+            "{} file(s) failed to parse and were not audited (--strict): {}",
+            skipped.len(),
+            files.join(", ")
+        )));
     }
     let skipped_note = match skipped.len() {
         0 => String::new(),
@@ -457,12 +470,81 @@ pub fn run(args: AuditArgs, out: Output) -> Result<(), CliError> {
     }
 
     if args.strict && !findings.is_empty() {
-        return Err(CliError(format!(
-            "{} audit finding(s) (--strict)",
-            findings.len()
-        )));
+        return Ok(AuditStatus::StrictFindings(findings.len()));
     }
-    Ok(())
+    Ok(AuditStatus::Pass)
+}
+
+/// What a directory walk decided: the `.rs` files to audit, and the paths it
+/// passed over with the reason, reported at detail verbosity.
+#[derive(Debug, Default)]
+struct Collection {
+    /// Files to read, with the path their findings are reported under.
+    files: Vec<(PathBuf, String)>,
+    /// Paths that were not read, and why.
+    skipped: Vec<(PathBuf, &'static str)>,
+    /// `.rs` files left out by `--include` or `--exclude`.
+    filtered_out: usize,
+}
+
+/// Walks `root` for the `.rs` files a directory audit reads (#151).
+///
+/// Symbolic links below `root` are never followed. A linked file or directory
+/// inside the tree is listed in [`Collection::skipped`] and not read, so a
+/// link cannot loop back into the tree or audit the same source under two
+/// paths. `root` itself is followed when it is a link: naming a path is a
+/// request to audit what it points at, and skipping it would turn a linked
+/// crate into a silent clean audit of zero files.
+///
+/// Excluded directories are pruned before they are read, and a traversal
+/// error stops the walk instead of letting it report a partial audit.
+fn collect_sources(root: &Path, filter: &PathFilter) -> Result<Collection, CliError> {
+    let mut collection = Collection::default();
+    let mut pruned = Vec::new();
+    let walker = WalkDir::new(root)
+        .follow_root_links(true)
+        .into_iter()
+        .filter_entry(|entry| {
+            // The root itself is always walked, whatever its type.
+            if entry.depth() == 0 || !entry.file_type().is_dir() {
+                return true;
+            }
+            let keep = !filter.excludes(&finding_path(root, entry.path()));
+            if !keep {
+                pruned.push((entry.path().to_path_buf(), "--exclude"));
+            }
+            keep
+        });
+    for entry in walker {
+        // A traversal error means at least one .rs file may never be
+        // examined, so stop instead of reporting a misleading clean audit.
+        let entry = entry.map_err(|err| traversal_error(root, &err))?;
+        // `path_is_symlink` is also true for a followed root, which is why
+        // the root is exempt from this check.
+        if entry.depth() > 0 && entry.path_is_symlink() {
+            collection
+                .skipped
+                .push((entry.path().to_path_buf(), "symlink, not followed"));
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.path().extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let display = finding_path(root, entry.path());
+        if !filter.selects(&display) {
+            collection.filtered_out += 1;
+            collection
+                .skipped
+                .push((entry.path().to_path_buf(), "--include/--exclude"));
+            continue;
+        }
+        collection.files.push((entry.path().to_path_buf(), display));
+    }
+    collection.skipped.append(&mut pruned);
+    Ok(collection)
 }
 
 /// Renders findings as the `audit --json` document, schema version
@@ -620,13 +702,105 @@ fn audit_source(
         }
     };
 
+    let mut helpers = HashMap::new();
+    let mut address_aliases = HashSet::new();
+    let mut i128_aliases = HashSet::new();
+    collect_file_items(&file, &mut helpers, &mut address_aliases, &mut i128_aliases);
+
     let mut visitor = FunctionVisitor {
         path: display.to_string(),
         rules,
         findings,
         contract_impl: None,
+        contract_impl_suppressed: false,
+        helpers: &helpers,
+        address_aliases: &address_aliases,
+        i128_aliases: &i128_aliases,
     };
     visitor.visit_file(&file);
+}
+
+fn collect_file_items<'a>(
+    file: &'a syn::File,
+    helpers: &mut HashMap<String, Vec<&'a syn::Block>>,
+    address_aliases: &mut HashSet<String>,
+    i128_aliases: &mut HashSet<String>,
+) {
+    for item in &file.items {
+        match item {
+            Item::Fn(f) => {
+                helpers
+                    .entry(f.sig.ident.to_string())
+                    .or_default()
+                    .push(&f.block);
+            }
+            Item::Impl(i) => {
+                for impl_item in &i.items {
+                    if let syn::ImplItem::Fn(f) = impl_item {
+                        helpers
+                            .entry(f.sig.ident.to_string())
+                            .or_default()
+                            .push(&f.block);
+                    }
+                }
+            }
+            Item::Use(u) => {
+                collect_use_tree(&u.tree, false, address_aliases, i128_aliases);
+            }
+            _ => {}
+        }
+    }
+
+    let mut changed = true;
+    let mut passes = 0;
+    while changed && passes < 10 {
+        changed = false;
+        passes += 1;
+        for item in &file.items {
+            if let Item::Type(t) = item {
+                let name = t.ident.to_string();
+                if type_is_address(&t.ty, address_aliases) {
+                    if address_aliases.insert(name.clone()) {
+                        changed = true;
+                    }
+                }
+                if type_is_i128(&t.ty, i128_aliases) {
+                    if i128_aliases.insert(name) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_use_tree(
+    tree: &syn::UseTree,
+    prefix_ends_in_address: bool,
+    address_aliases: &mut HashSet<String>,
+    i128_aliases: &mut HashSet<String>,
+) {
+    match tree {
+        syn::UseTree::Path(p) => {
+            let is_address = p.ident == "Address";
+            collect_use_tree(&p.tree, is_address, address_aliases, i128_aliases);
+        }
+        syn::UseTree::Name(_) => {}
+        syn::UseTree::Rename(r) => {
+            if r.ident == "Address" || prefix_ends_in_address {
+                address_aliases.insert(r.rename.to_string());
+            }
+            if r.ident == "i128" {
+                i128_aliases.insert(r.rename.to_string());
+            }
+        }
+        syn::UseTree::Group(g) => {
+            for item in &g.items {
+                collect_use_tree(item, prefix_ends_in_address, address_aliases, i128_aliases);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
 }
 
 /// The parser's message, made actionable for tokenizer failures: syn reports
@@ -671,19 +845,56 @@ fn is_contractimpl(attrs: &[Attribute]) -> bool {
     })
 }
 
+fn has_auth_suppression(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(is_auth_suppression_attr)
+}
+
+fn is_auth_suppression_attr(attr: &Attribute) -> bool {
+    if !attr.path().is_ident("allow") {
+        return false;
+    }
+    let syn::Meta::List(meta_list) = &attr.meta else {
+        return false;
+    };
+    let Ok(nested) = meta_list.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return false;
+    };
+    for meta in nested {
+        if let syn::Meta::Path(p) = meta {
+            let idents: Vec<_> = p.segments.iter().map(|s| s.ident.to_string()).collect();
+            if idents.last().map(|s| s.as_str()) == Some("missing_require_auth") {
+                if idents.len() == 1
+                    || (idents.len() == 2
+                        && matches!(idents[0].as_str(), "soroban_testkit" | "testkit" | "audit"))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 struct FunctionVisitor<'a> {
     path: String,
     rules: &'a [Rule],
     findings: &'a mut Vec<Finding>,
     /// Set while visiting the items of a `#[contractimpl]` block.
     contract_impl: Option<EntryPoints>,
+    contract_impl_suppressed: bool,
+    helpers: &'a HashMap<String, Vec<&'a syn::Block>>,
+    address_aliases: &'a HashSet<String>,
+    i128_aliases: &'a HashSet<String>,
 }
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
-        let line = line_of(node);
+        let line = fn_line(&node.sig);
         // A free function is never an entry point, even when nested in one.
-        self.audit_function(&node.sig, &node.block, line, false);
+        let suppressed = has_auth_suppression(&node.attrs);
+        self.audit_function(&node.sig, &node.block, line, false, suppressed);
         self.audit_i128_arithmetic(&node.sig, &node.block);
         // Continues into nested items, which are audited as their own functions
         visit::visit_item_fn(self, node);
@@ -691,23 +902,27 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
 
     fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
         let outer = self.contract_impl;
+        let outer_suppressed = self.contract_impl_suppressed;
         self.contract_impl = is_contractimpl(&node.attrs).then_some(if node.trait_.is_some() {
             EntryPoints::AllFns
         } else {
             EntryPoints::PublicFns
         });
+        self.contract_impl_suppressed = has_auth_suppression(&node.attrs);
         visit::visit_item_impl(self, node);
         self.contract_impl = outer;
+        self.contract_impl_suppressed = outer_suppressed;
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
-        let line = line_of(node);
+        let line = fn_line(&node.sig);
         let entry_point = match self.contract_impl {
             Some(EntryPoints::AllFns) => true,
             Some(EntryPoints::PublicFns) => matches!(node.vis, Visibility::Public(_)),
             None => false,
         };
-        self.audit_function(&node.sig, &node.block, line, entry_point);
+        let suppressed = self.contract_impl_suppressed || has_auth_suppression(&node.attrs);
+        self.audit_function(&node.sig, &node.block, line, entry_point, suppressed);
         self.audit_i128_arithmetic(&node.sig, &node.block);
         visit::visit_impl_item_fn(self, node);
     }
@@ -724,11 +939,13 @@ impl FunctionVisitor<'_> {
         body: &syn::Block,
         line: usize,
         entry_point: bool,
+        suppressed: bool,
     ) {
         let name = sig.ident.to_string();
 
         // Rule 1: an entry point's Address parameter that's never checked
         // with require_auth. Helpers are reached through an entry point.
+ fix/audit-136-138-139
         let address_params = address_typed_params(sig);
         if entry_point && self.runs(Rule::MissingRequireAuth) && !address_params.is_empty() {
             let mut tracked_addrs = HashSet::new();
@@ -741,6 +958,17 @@ impl FunctionVisitor<'_> {
             }
             let mut auth_visitor = RequireAuthVisitor {
                 tracked_addrs,
+
+        let address_params = address_typed_params(sig, self.address_aliases);
+        if entry_point
+            && !suppressed
+            && self.runs(Rule::MissingRequireAuth)
+            && !address_params.is_empty()
+        {
+            let mut auth_visitor = RequireAuthVisitor {
+                helpers: self.helpers,
+                visiting: HashSet::new(),
+ main
                 has_require_auth: false,
             };
             auth_visitor.visit_block(body);
@@ -799,10 +1027,8 @@ impl FunctionVisitor<'_> {
         let mut i128_bindings: HashSet<String> = HashSet::new();
         for arg in &sig.inputs {
             if let FnArg::Typed(pat_type) = arg {
-                if type_is_i128(&pat_type.ty) {
-                    if let Pat::Ident(ident) = &*pat_type.pat {
-                        i128_bindings.insert(ident.ident.to_string());
-                    }
+                if type_is_i128(&pat_type.ty, self.i128_aliases) {
+                    extract_pat_idents(&pat_type.pat, &mut i128_bindings);
                 }
             }
         }
@@ -811,48 +1037,63 @@ impl FunctionVisitor<'_> {
             path: self.path.clone(),
             fn_name: sig.ident.to_string(),
             i128_bindings,
+            i128_aliases: self.i128_aliases,
             findings: self.findings,
         };
         visitor.visit_block(body);
     }
 }
 
-fn address_typed_params(sig: &Signature) -> Vec<String> {
+fn address_typed_params(sig: &Signature, aliases: &HashSet<String>) -> Vec<String> {
     sig.inputs
         .iter()
         .filter_map(|arg| match arg {
-            FnArg::Typed(pat_type) if type_is_address(&pat_type.ty) => match &*pat_type.pat {
-                Pat::Ident(ident) => Some(ident.ident.to_string()),
-                _ => Some("<pattern>".to_string()),
-            },
+            FnArg::Typed(pat_type) if type_is_address(&pat_type.ty, aliases) => {
+                match &*pat_type.pat {
+                    Pat::Ident(ident) => Some(ident.ident.to_string()),
+                    _ => Some("<pattern>".to_string()),
+                }
+            }
             _ => None,
         })
         .collect()
 }
 
-fn type_is_address(ty: &Type) -> bool {
+fn type_is_address(ty: &Type, aliases: &HashSet<String>) -> bool {
     match ty {
-        Type::Reference(r) => type_is_address(&r.elem),
-        Type::Path(p) => p
-            .path
-            .segments
-            .last()
-            .is_some_and(|seg| seg.ident == "Address"),
+        Type::Reference(r) => type_is_address(&r.elem, aliases),
+        Type::Group(g) => type_is_address(&g.elem, aliases),
+        Type::Paren(p) => type_is_address(&p.elem, aliases),
+        Type::Path(p) => {
+            p.path.segments.last().is_some_and(|seg| {
+                seg.ident == "Address" || aliases.contains(&seg.ident.to_string())
+            })
+        }
         _ => false,
     }
 }
 
-fn line_of(node: impl ToTokens) -> usize {
-    first_span(node).start().line
+/// The 1-based line of a function's `fn` keyword (#152). Read from the AST
+/// rather than from the item's tokens: those start with any outer attribute
+/// or doc comment (`#[doc = ...]`), so a documented function would otherwise
+/// be reported at its doc comment instead of its definition.
+fn fn_line(sig: &Signature) -> usize {
+    sig.fn_token.span.start().line
 }
 
-/// The span of the first token produced by `node`. For a `BinOp` this is
-/// the operator itself, which is what arithmetic findings point at.
-fn first_span(node: impl ToTokens) -> Span {
-    node.to_token_stream()
-        .into_iter()
-        .next()
-        .map_or_else(Span::call_site, |token| token.span())
+/// The 1-based line of an arithmetic operator, which is where arithmetic
+/// findings point. Read from the operator's own span (#153), not from a
+/// token stream.
+fn op_line(op: &BinOp) -> usize {
+    let span = match op {
+        BinOp::Add(token) => token.spans[0],
+        BinOp::Sub(token) => token.spans[0],
+        BinOp::Mul(token) => token.spans[0],
+        BinOp::Div(token) => token.spans[0],
+        // `is_arithmetic` admits only the four operators above.
+        _ => Span::call_site(),
+    };
+    span.start().line
 }
 
 /// Rule 2 uses a dedicated AST walk (rather than a text search) because
@@ -868,6 +1109,7 @@ struct I128ArithmeticVisitor<'a> {
     path: String,
     fn_name: String,
     i128_bindings: HashSet<String>,
+    i128_aliases: &'a HashSet<String>,
     findings: &'a mut Vec<Finding>,
 }
 
@@ -878,12 +1120,17 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
     fn visit_local(&mut self, node: &'ast Local) {
         let mut is_i128 = false;
         if let Pat::Type(pat_type) = &node.pat {
+ fix/audit-136-138-139
             if type_is_i128(&pat_type.ty) {
+
+            if type_is_i128(&pat_type.ty, self.i128_aliases) {
+ main
                 is_i128 = true;
             }
         }
         if !is_i128 {
             if let Some(init) = &node.init {
+ fix/audit-136-138-139
                 if self.touches_i128(&init.expr) {
                     is_i128 = true;
                 }
@@ -895,8 +1142,15 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
             } else if let Pat::Type(pat_type) = &node.pat {
                 if let Pat::Ident(ident) = &*pat_type.pat {
                     self.i128_bindings.insert(ident.ident.to_string());
+
+                if self.is_i128_expr(&init.expr) {
+                    is_i128 = true;
+ main
                 }
             }
+        }
+        if is_i128 {
+            extract_pat_idents(&node.pat, &mut self.i128_bindings);
         }
         visit::visit_local(self, node);
     }
@@ -1081,6 +1335,7 @@ fn is_int_literal(expr: &Expr) -> bool {
 }
 
 impl I128ArithmeticVisitor<'_> {
+ fix/audit-136-138-139
     fn push_arithmetic_finding(&mut self, line: usize) {
         self.findings.push(Finding {
             file: self.path.clone(),
@@ -1093,6 +1348,21 @@ impl I128ArithmeticVisitor<'_> {
                 self.fn_name
             ),
         });
+
+    fn is_i128_expr(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Path(p) => p
+                .path
+                .get_ident()
+                .is_some_and(|ident| self.i128_bindings.contains(&ident.to_string())),
+            Expr::Lit(lit) => matches!(&lit.lit, syn::Lit::Int(i) if i.suffix() == "i128"),
+            Expr::Reference(r) => self.is_i128_expr(&r.expr),
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.is_i128_expr(&u.expr),
+            Expr::Paren(p) => self.is_i128_expr(&p.expr),
+            Expr::Group(g) => self.is_i128_expr(&g.expr),
+            _ => false,
+        }
+ main
     }
 
     /// Whether any operand anywhere in this arithmetic expression (looking
@@ -1155,6 +1425,7 @@ impl I128ArithmeticVisitor<'_> {
                 .is_some_and(|ident| self.i128_bindings.contains(&ident.to_string())),
             Expr::Lit(lit) => matches!(&lit.lit, syn::Lit::Int(i) if i.suffix() == "i128"),
             Expr::Reference(r) => self.touches_i128(&r.expr),
+ fix/audit-136-138-139
             Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_) | syn::UnOp::Neg(_)) => {
                 self.touches_i128(&u.expr)
             }
@@ -1179,6 +1450,9 @@ impl I128ArithmeticVisitor<'_> {
                     false
                 }
             }
+
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.touches_i128(&u.expr),
+ main
             Expr::Paren(p) => self.touches_i128(&p.expr),
             Expr::Group(g) => self.touches_i128(&g.expr),
             _ => false,
@@ -1186,6 +1460,7 @@ impl I128ArithmeticVisitor<'_> {
     }
 }
 
+ fix/audit-136-138-139
 fn extract_pat_idents(pat: &Pat, bindings: &mut HashSet<String>) {
     match pat {
         Pat::Ident(ident) => {
@@ -1219,10 +1494,49 @@ fn type_is_i128(ty: &Type) -> bool {
 /// (or a local alias of one) in the function body.
 struct RequireAuthVisitor {
     tracked_addrs: HashSet<String>,
+
+fn type_is_i128(ty: &Type, aliases: &HashSet<String>) -> bool {
+    match ty {
+        Type::Reference(r) => type_is_i128(&r.elem, aliases),
+        Type::Group(g) => type_is_i128(&g.elem, aliases),
+        Type::Paren(p) => type_is_i128(&p.elem, aliases),
+        Type::Path(p) => {
+            p.path.is_ident("i128")
+                || p.path.segments.last().is_some_and(|seg| {
+                    seg.ident == "i128" || aliases.contains(&seg.ident.to_string())
+                })
+        }
+        _ => false,
+    }
+}
+
+fn extract_pat_idents(pat: &Pat, bindings: &mut HashSet<String>) {
+    match pat {
+        Pat::Ident(ident) => {
+            bindings.insert(ident.ident.to_string());
+        }
+        Pat::Reference(r) => extract_pat_idents(&r.pat, bindings),
+        Pat::Type(t) => extract_pat_idents(&t.pat, bindings),
+        Pat::Paren(p) => extract_pat_idents(&p.pat, bindings),
+        Pat::Tuple(t) => {
+            for elem in &t.elems {
+                extract_pat_idents(elem, bindings);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Visitor that checks if require_auth is called anywhere in the function body
+/// or in delegated helper functions.
+struct RequireAuthVisitor<'a> {
+    helpers: &'a HashMap<String, Vec<&'a syn::Block>>,
+    visiting: HashSet<String>,
+ main
     has_require_auth: bool,
 }
 
-impl<'ast> Visit<'ast> for RequireAuthVisitor {
+impl<'ast> Visit<'ast> for RequireAuthVisitor<'_> {
     // A nested function's require_auth does not authorize the outer function
     fn visit_item(&mut self, _node: &'ast Item) {}
 
@@ -1250,11 +1564,13 @@ impl<'ast> Visit<'ast> for RequireAuthVisitor {
                 self.has_require_auth = true;
                 return;
             }
+            _ => {}
         }
         visit::visit_expr(self, node);
     }
 }
 
+ fix/audit-136-138-139
 impl RequireAuthVisitor {
     fn is_tracked_addr(&self, expr: &Expr) -> bool {
         match expr {
@@ -1273,6 +1589,28 @@ impl RequireAuthVisitor {
             }
             _ => false,
         }
+
+impl RequireAuthVisitor<'_> {
+    fn check_helper_auth(&mut self, name: &str) -> bool {
+        if let Some(blocks) = self.helpers.get(name) {
+            if self.visiting.insert(name.to_string()) {
+                for block in blocks {
+                    let mut inner_visitor = RequireAuthVisitor {
+                        helpers: self.helpers,
+                        visiting: self.visiting.clone(),
+                        has_require_auth: false,
+                    };
+                    inner_visitor.visit_block(block);
+                    if inner_visitor.has_require_auth {
+                        self.visiting.remove(name);
+                        return true;
+                    }
+                }
+                self.visiting.remove(name);
+            }
+        }
+        false
+ main
     }
 }
 
@@ -1379,36 +1717,77 @@ mod tests {
         assert_eq!(json_string("a\"b\\c\nd\u{1}"), expected);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn non_utf8_paths_are_lossy_displayed_without_panicking() {
-        // Test that finding_path handles path components gracefully
+    fn non_utf8_path_components_are_displayed_with_replacement_characters_without_panicking() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
         let p = |s: &str| PathBuf::from(s);
-        // Normal UTF-8 paths work as before
         assert_eq!(finding_path(&p("."), &p("./src/lib.rs")), "src/lib.rs");
-        // Path display uses lossy conversion, so non-UTF8 bytes are replaced
-        // with the replacement character (U+FFFD). This is verified by ensuring
-        // the function doesn't panic and returns a valid string.
-        let _ = finding_path(&p("."), &p("./src/lib.rs"));
+
+        let file = PathBuf::from(OsStr::from_bytes(b"./src/\xff/lib-\xfe.rs"));
+        assert_eq!(finding_path(&p("."), &file), "src/\u{fffd}/lib-\u{fffd}.rs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_file_name_is_audited_under_a_lossy_path_when_collecting() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tree = TempTree::new("non-utf8");
+        let name = OsStr::from_bytes(b"lib-\xff.rs");
+        let path = tree.root.join(name);
+        std::fs::write(&path, "fn f(a: i128) -> i128 {\n    a + 1i128\n}\n")
+            .expect("write non-UTF8 source");
+
+        let collection = collect(&tree.root);
+        assert_eq!(displays(&collection), vec!["lib-\u{fffd}.rs"]);
+
+        let (path, display) = &collection.files[0];
+        let mut findings = Vec::new();
+        let mut skipped = Vec::new();
+        audit_file(path, display, &Rule::ALL, &mut findings, &mut skipped)
+            .expect("audit non-UTF8 file");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].file, "lib-\u{fffd}.rs");
+    }
+
+    #[test]
+    fn function_line_is_the_fn_keyword_line_when_a_doc_comment_precedes_it() {
+        let src = "#[contractimpl]\nimpl Vault {\n    /// Pays `to`.\n    /// Second doc line.\n    #[allow(dead_code)]\n    pub fn pay(\n        env: Env,\n        to: Address,\n    ) {}\n}\n";
+        assert_eq!(auth_findings(src), vec![6]);
+    }
+
+    #[test]
+    fn function_line_ignores_block_and_line_comments_above_multiline_signatures() {
+        let src = "/*\n * block\n */\n// line comment\nfn helper() {}\n#[contractimpl]\nimpl Vault {\n    pub fn pay(\n        env: Env,\n        to: Address,\n    ) {}\n}\n";
+        assert_eq!(auth_findings(src), vec![8]);
+    }
+
+    #[test]
+    fn storage_finding_points_at_the_fn_line_when_documented_and_multiline() {
+        let src = "/// Reads the balance.\n#[allow(unused)]\nfn balance(\n    env: Env,\n) -> i128 {\n    env.storage().persistent().get(&key)\n}\n";
+        assert_eq!(
+            rules_of(src, &[Rule::MissingTtlBump]),
+            vec![("missing-ttl-bump", 3)]
+        );
     }
 
     #[test]
     fn multiline_function_line_number_is_the_function_definition_line() {
         let src = r#"
-        fn test_function(
-            param1: i128,
-            param2: i128,
-        ) {
-            let total = param1 + param2;
+        #[contractimpl]
+        impl C {
+            pub fn pay(
+                env: Env,
+                to: Address,
+            ) {}
         }
         "#;
-        let mut findings = Vec::new();
-        audit_source(src, "test.rs", &Rule::ALL, &mut findings, &mut Vec::new());
-        // The line number should correspond to the first line of the function definition
-        // (line 2 in this case, since line 1 is blank)
-        if let Some(finding) = findings.first() {
-            // Line numbers from syn are 1-indexed starting at the 'fn' keyword
-            assert!(finding.line > 0, "finding line should be positive");
-        }
+        assert_eq!(auth_findings(src), vec![4]);
     }
 
     #[test]
@@ -1459,17 +1838,8 @@ fn pay(
             }
         }
         "#;
-        let mut findings = Vec::new();
-        audit_source(src, "test.rs", &Rule::ALL, &mut findings, &mut Vec::new());
-        if let Some(finding) = findings.first() {
-            // Should still report the missing-require-auth at the function definition line,
-            // not at a line in the comment
-            assert!(
-                finding.message.contains("require_auth"),
-                "should detect missing require_auth despite comments"
-            );
-            assert!(finding.line > 0, "finding line should be positive");
-        }
+        // The finding is at the `pub fn` line (line 8), not at a comment line.
+        assert_eq!(auth_findings(src), vec![8]);
     }
 
     #[test]
@@ -1908,6 +2278,7 @@ impl Vault {
         );
     }
 
+ fix/audit-136-138-139
     #[test]
     fn i128_remainder_negation_and_compound_assignments_are_flagged() {
         let src = r#"
@@ -1965,6 +2336,312 @@ fn safe_chains(a: i128, b: i128, c: i128) -> Option<i128> {
     let y = x.saturating_add(1).wrapping_sub(2);
     let z = i128::checked_div(y, 3)?;
     Some(z)
+=======
+    // ---- #153: auth and TTL checks read the AST, not formatting ----------
+
+    #[test]
+    fn require_auth_in_a_comment_or_string_does_not_satisfy_the_check() {
+        let src = "#[contractimpl]\nimpl Vault {\n    pub fn pay(env: Env, to: Address) {\n        // to.require_auth();\n        let note = \"to.require_auth()\";\n    }\n}\n";
+        assert_eq!(auth_findings(src), vec![3]);
+    }
+
+    #[test]
+    fn require_auth_is_found_regardless_of_spacing_and_line_breaks() {
+        let compact = "#[contractimpl]\nimpl Vault {\n    pub fn pay(env: Env, to: Address) {\n        to.require_auth();\n    }\n}\n";
+        let spread = "#[contractimpl]\nimpl Vault {\n    pub fn pay(env: Env, to: Address) {\n        to\n            .require_auth ( ) ;\n    }\n}\n";
+        assert_eq!(auth_findings(compact), Vec::<usize>::new());
+        assert_eq!(auth_findings(spread), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn storage_read_is_found_regardless_of_spacing_and_line_breaks() {
+        let src = "fn read(env: Env) {\n    let v = env\n        .storage ( )\n        . temporary ( )\n        .get ( &k ) ;\n}\n";
+        assert_eq!(
+            rules_of(src, &[Rule::MissingTtlBump]),
+            vec![("missing-ttl-bump", 1)]
+        );
+    }
+
+    #[test]
+    fn extend_ttl_in_a_comment_does_not_satisfy_the_ttl_check() {
+        let src = "fn read(env: Env) {\n    // env.storage().persistent().extend_ttl(&k, 1, 1);\n    let v = env.storage().persistent().get(&k);\n}\n";
+        assert_eq!(
+            rules_of(src, &[Rule::MissingTtlBump]),
+            vec![("missing-ttl-bump", 1)]
+        );
+    }
+
+    // ---- #151: symlinks and directory traversal -------------------------
+
+    /// A throwaway directory under the system temp dir, removed on drop.
+    struct TempTree {
+        root: PathBuf,
+    }
+
+    impl TempTree {
+        fn new(name: &str) -> Self {
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "soroban-testkit-audit-{name}-{}-{stamp}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).expect("create temp audit tree");
+            TempTree { root }
+        }
+
+        fn write(&self, relative: &str, contents: &str) -> PathBuf {
+            let path = self.root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("file has a parent"))
+                .expect("create parent directories");
+            std::fs::write(&path, contents).expect("write temp source");
+            path
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn collect(root: &Path) -> Collection {
+        collect_sources(root, &PathFilter::default()).expect("collect temp audit tree")
+    }
+
+    fn displays(collection: &Collection) -> Vec<&str> {
+        collection
+            .files
+            .iter()
+            .map(|(_, display)| display.as_str())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_inside_the_tree_is_not_followed_when_collecting() {
+        let tree = TempTree::new("linked-dir");
+        tree.write("src/lib.rs", "fn ok() {}\n");
+        tree.write("outside/gen.rs", "fn gen() {}\n");
+        std::os::unix::fs::symlink(tree.root.join("outside"), tree.root.join("src/linked"))
+            .expect("symlink directory");
+
+        let collection = collect(&tree.root.join("src"));
+        assert_eq!(displays(&collection), vec!["lib.rs"]);
+        assert_eq!(
+            collection.skipped,
+            vec![(tree.root.join("src/linked"), "symlink, not followed")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_rust_file_inside_the_tree_is_not_audited_twice() {
+        let tree = TempTree::new("linked-file");
+        let real = tree.write("src/lib.rs", "fn ok() {}\n");
+        std::os::unix::fs::symlink(&real, tree.root.join("src/alias.rs")).expect("symlink file");
+
+        let collection = collect(&tree.root.join("src"));
+        assert_eq!(displays(&collection), vec!["lib.rs"]);
+        assert_eq!(
+            collection.skipped,
+            vec![(tree.root.join("src/alias.rs"), "symlink, not followed")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_root_directory_is_followed_when_named_explicitly() {
+        let tree = TempTree::new("linked-root-dir");
+        tree.write("real/src/lib.rs", "fn ok() {}\n");
+        std::os::unix::fs::symlink(tree.root.join("real/src"), tree.root.join("crate"))
+            .expect("symlink root directory");
+
+        let collection = collect(&tree.root.join("crate"));
+        assert_eq!(displays(&collection), vec!["lib.rs"]);
+        assert!(collection.skipped.is_empty(), "{:?}", collection.skipped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_root_file_is_audited_under_its_own_file_name() {
+        let tree = TempTree::new("linked-root-file");
+        let real = tree.write("real.rs", "fn ok() {}\n");
+        let link = tree.root.join("link.rs");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink root file");
+
+        let collection = collect(&link);
+        assert_eq!(displays(&collection), vec!["link.rs"]);
+    }
+
+    #[test]
+    fn excluded_directories_are_pruned_and_listed_when_collecting() {
+        let tree = TempTree::new("pruned");
+        tree.write("src/lib.rs", "fn ok() {}\n");
+        tree.write("target/gen.rs", "fn gen() {}\n");
+
+        let collection =
+            collect_sources(&tree.root, &filter(&[], &["target"])).expect("collect temp tree");
+        assert_eq!(displays(&collection), vec!["src/lib.rs"]);
+        assert_eq!(
+            collection.skipped,
+            vec![(tree.root.join("target"), "--exclude")]
+        );
+    }
+
+    // ---- #141: auth rule exemptions -------------------------------------
+
+    #[test]
+    fn auth_suppression_allows_intentional_open_entry_points() {
+        let src = r#"
+#[contractimpl]
+impl Contract {
+    #[allow(soroban_testkit::missing_require_auth)]
+    pub fn open_scoped(who: Address) {}
+
+    #[allow(missing_require_auth)]
+    pub fn open_unscoped(who: Address) {}
+
+    #[allow(testkit::missing_require_auth)]
+    pub fn open_testkit(who: Address) {}
+
+    #[allow(clippy::too_many_arguments, soroban_testkit::missing_require_auth)]
+    pub fn open_combined(who: Address) {}
+
+    pub fn unannotated(who: Address) {}
+}
+
+#[allow(soroban_testkit::missing_require_auth)]
+#[contractimpl]
+impl OpenImpl {
+    pub fn init(admin: Address) {}
+}
+"#;
+        assert_eq!(auth_findings(src), vec![16]);
+    }
+
+    #[test]
+    fn malformed_allow_annotations_do_not_suppress_or_panic() {
+        let src = r#"
+#[contractimpl]
+impl Contract {
+    #[allow]
+    pub fn bare_allow(who: Address) {}
+
+    #[allow = "missing_require_auth"]
+    pub fn name_value_allow(who: Address) {}
+
+    #[allow()]
+    pub fn empty_allow(who: Address) {}
+
+    #[allow(123)]
+    pub fn literal_allow(who: Address) {}
+
+    #[allow(unused_variables)]
+    pub fn unrelated_allow(who: Address) {}
+
+    #[allow(clippy::missing_require_auth)]
+    pub fn wrong_scope_allow(who: Address) {}
+}
+"#;
+        assert_eq!(auth_findings(src), vec![5, 8, 11, 14, 17, 20]);
+    }
+
+    // ---- #135: authorization checked in helper --------------------------
+
+    #[test]
+    fn delegated_helper_direct_check_satisfies_auth_rule() {
+        let src = r#"
+fn check_caller(caller: &Address) {
+    caller.require_auth();
+}
+
+impl Contract {
+    fn verify_self(&self, user: &Address) {
+        user.require_auth_for_args(());
+    }
+
+    fn assert_admin(admin: &Address) {
+        admin.require_auth();
+    }
+}
+
+#[contractimpl]
+impl Contract {
+    pub fn via_free_fn(env: Env, caller: Address) {
+        check_caller(&caller);
+    }
+
+    pub fn via_self_method(&self, env: Env, user: Address) {
+        self.verify_self(&user);
+    }
+
+    pub fn via_assoc_fn(env: Env, admin: Address) {
+        Self::assert_admin(&admin);
+    }
+}
+"#;
+        assert_eq!(auth_findings(src), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn delegated_helper_indirect_check_satisfies_auth_rule() {
+        let src = r#"
+fn step_one(user: &Address) {
+    step_two(user);
+}
+
+fn step_two(user: &Address) {
+    user.require_auth();
+}
+
+#[contractimpl]
+impl Contract {
+    pub fn execute(env: Env, user: Address) {
+        step_one(&user);
+    }
+}
+"#;
+        assert_eq!(auth_findings(src), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn recursive_helpers_without_require_auth_still_report() {
+        let src = r#"
+fn ping(a: &Address) {
+    pong(a);
+}
+
+fn pong(a: &Address) {
+    ping(a);
+}
+
+#[contractimpl]
+impl Contract {
+    pub fn execute(env: Env, user: Address) {
+        ping(&user);
+    }
+}
+"#;
+        assert_eq!(auth_findings(src), vec![12]);
+    }
+
+    // ---- #140: arithmetic i128 reference tracking -----------------------
+
+    #[test]
+    fn i128_reference_parameters_and_deref_arithmetic_are_detected() {
+        let src = r#"
+fn add_ref(a: &i128) -> i128 {
+    *a + 1
+}
+
+fn sub_mut_ref(a: &mut i128) -> i128 {
+    *a - 2
+ main
 }
 "#;
         assert_eq!(
@@ -1974,6 +2651,7 @@ fn safe_chains(a: i128, b: i128, c: i128) -> Option<i128> {
     }
 
     #[test]
+ fix/audit-136-138-139
     fn unchecked_method_forms_and_mixed_chains_are_flagged() {
         let src = r#"
 use core::ops::Add;
@@ -1988,18 +2666,36 @@ fn mixed(a: i128, b: i128, c: i128) -> i128 {
     let m7 = a.checked_add(b + c).unwrap();
     let m8 = a.saturating_add(b) * 2;
     m1 + m2 + m3 + m4 + m5 + m6 + m7 + m8
+
+    fn i128_simple_aliases_and_reference_bindings_are_detected() {
+        let src = r#"
+type Balance = i128;
+
+fn aliases(a: i128, b: Balance) -> i128 {
+    let alias = a;
+    let r = &a;
+    let deref_alias = *r;
+    let x = alias + 1;
+    let y = *r * 2;
+    let z = deref_alias - 3;
+    b / 2
+ main
 }
 "#;
         assert_eq!(
             rules_of(src, &[Rule::UncheckedI128Arithmetic]),
             vec![
+ fix/audit-136-138-139
                 ("unchecked-i128-arithmetic", 5),
                 ("unchecked-i128-arithmetic", 6),
                 ("unchecked-i128-arithmetic", 7),
+
+ main
                 ("unchecked-i128-arithmetic", 8),
                 ("unchecked-i128-arithmetic", 9),
                 ("unchecked-i128-arithmetic", 10),
                 ("unchecked-i128-arithmetic", 11),
+ fix/audit-136-138-139
                 ("unchecked-i128-arithmetic", 12),
                 ("unchecked-i128-arithmetic", 13),
             ]
@@ -2051,5 +2747,46 @@ impl Contract {
 }
 "#;
         assert_eq!(auth_findings(src), Vec::<usize>::new());
+            ]
+        );
+    }
+
+    #[test]
+    fn non_i128_aliases_and_references_are_not_flagged() {
+        let src = r#"
+fn safe_u128(a: u128) -> u128 {
+    let b = a;
+    let r = &b;
+    *r + 1
+}
+"#;
+        assert_eq!(
+            rules_of(src, &[Rule::UncheckedI128Arithmetic]),
+            Vec::<(&'static str, usize)>::new()
+        );
+    }
+
+    // ---- #137: qualified Address parameter detection --------------------
+
+    #[test]
+    fn qualified_and_aliased_address_parameters_are_detected() {
+        let src = r#"
+use soroban_sdk::Address as AccountId;
+type UserAddress = soroban_sdk::Address;
+type ChainedAddress = UserAddress;
+
+#[contractimpl]
+impl Contract {
+    pub fn pay_qualified(to: soroban_sdk::Address) {}
+    pub fn pay_rooted(to: ::soroban_sdk::Address) {}
+    pub fn pay_ref_qualified(to: &soroban_sdk::Address) {}
+    pub fn pay_use_alias(to: AccountId) {}
+    pub fn pay_ref_use_alias(to: &AccountId) {}
+    pub fn pay_type_alias(to: UserAddress) {}
+    pub fn pay_chained_alias(to: ChainedAddress) {}
+}
+"#;
+        assert_eq!(auth_findings(src), vec![8, 9, 10, 11, 12, 13, 14]);
+ main
     }
 }

@@ -1,0 +1,52 @@
+#![cfg(test)]
+use soroban_sdk::{
+    contract, contractimpl, symbol_short,
+    testutils::{Address as _, Events},
+    Address, Env, Symbol, TryFromVal,
+};
+
+#[contract]
+pub struct EventContract;
+
+#[contractimpl]
+impl EventContract {
+    pub fn log_transfer(env: Env, to: Address, amount: i128, memo: Symbol) {
+        // The data payload is a tuple.
+        env.events()
+            .publish((symbol_short!("xfer"), to), (amount, memo));
+    }
+}
+
+#[test]
+fn decodes_tuple_event_payload() {
+    let env = Env::default();
+    let id = env.register(EventContract, ());
+    let client = EventContractClient::new(&env, &id);
+    let to = Address::generate(&env);
+
+    client.log_transfer(&to, &42_i128, &symbol_short!("rent"));
+
+    let (contract, _topics, data) = env.events().all().last().unwrap();
+    assert_eq!(contract, id);
+
+    // Happy path: the shape matches the published tuple.
+    let (amount, memo) = <(i128, Symbol)>::try_from_val(&env, &data).unwrap();
+    assert_eq!(amount, 42);
+    assert_eq!(memo, symbol_short!("rent"));
+}
+
+#[test]
+fn rejects_mismatched_tuple_shape() {
+    let env = Env::default();
+    let id = env.register(EventContract, ());
+    let client = EventContractClient::new(&env, &id);
+    let to = Address::generate(&env);
+    client.log_transfer(&to, &42_i128, &symbol_short!("rent"));
+
+    let (_, _, data) = env.events().all().last().unwrap();
+
+    // Wrong arity.
+    assert!(<(i128, Symbol, u32)>::try_from_val(&env, &data).is_err());
+    // Wrong element type.
+    assert!(<(u32, Symbol)>::try_from_val(&env, &data).is_err());
+}

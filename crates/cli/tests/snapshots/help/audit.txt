@@ -17,9 +17,11 @@ to run only some rules, or --exclude-rule to skip some, and
 These are syntactic heuristics: findings can be false positives, and
 no findings does not mean a contract is secure. Files that fail to
 parse are not audited; each is listed with its parse error (as a
-warning on stderr, or in the JSON `skipped` field). Findings and
-skipped files exit 0 unless --strict is passed, which fails on
-findings only.
+warning on stderr, or in the JSON `skipped` field).
+
+Exit status: 0 when the scan completes; 1 when --strict is passed and
+findings are reported; 2 for invalid input, which is a PATH that is
+missing or unreadable, or, with --strict, a file that fails to parse.
 
 Usage: soroban-testkit audit [OPTIONS] [PATH]
 
@@ -37,8 +39,8 @@ Options:
           (e.g. cargo). Same as setting the `NO_COLOR` environment variable
 
       --strict
-          Exit 1 if any findings are reported. Without it, findings are
-          printed and the command still exits 0
+          Exit 1 if any findings are reported, or 2 if a file failed to parse.
+          Without it, findings are printed and the command still exits 0
 
       --json
           Print findings as a JSON document (`schema_version` 1) on stdout

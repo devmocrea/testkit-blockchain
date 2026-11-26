@@ -1,7 +1,8 @@
 //! Error output consistency (#202): every subcommand reports a failure as
 //! exit status 1 plus a single `error: <message>` line on stderr, with no
-//! Rust debug output, panic, or backtrace. See the conventions on
-//! `CliError` in `src/commands/mod.rs`.
+//! Rust debug output, panic, or backtrace. The one documented exception is
+//! `audit` invalid input, which exits 2. See the conventions on `CliError`
+//! in `src/commands/mod.rs`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -24,6 +25,31 @@ fn run(args: &[&str]) -> Output {
         .expect("failed to run soroban-testkit")
 }
 
+/// Runs the CLI with `source` written to its stdin.
+fn run_with_stdin(args: &[&str], source: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
+        .args(args)
+        .current_dir(workspace_root())
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run soroban-testkit");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(source.as_bytes())
+        .unwrap();
+    child
+        .wait_with_output()
+        .expect("failed to wait for soroban-testkit")
+}
+
 /// Shapes of raw `Debug` output that must never reach the user.
 const DEBUG_MARKERS: &[&str] = &[
     "Os {",
@@ -39,8 +65,14 @@ const DEBUG_MARKERS: &[&str] = &[
 /// Asserts `output` is a command failure in the shared format and returns
 /// its message (the stderr text after `error: `).
 fn assert_cli_error(output: &Output) -> String {
+    assert_cli_error_with_code(output, 1)
+}
+
+/// [`assert_cli_error`] for a failure with a documented exit status other
+/// than 1.
+fn assert_cli_error_with_code(output: &Output, code: i32) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert_eq!(output.status.code(), Some(code), "stderr: {stderr}");
     assert!(stderr.starts_with("error: "), "{stderr}");
     assert!(stderr.ends_with('\n'), "{stderr:?}");
     assert_eq!(stderr.matches("error:").count(), 1, "{stderr}");
@@ -57,7 +89,7 @@ fn assert_cli_error(output: &Output) -> String {
 #[test]
 fn audit_of_a_missing_path_fails_instead_of_reporting_no_findings() {
     let output = run(&["audit", "does/not/exist"]);
-    let message = assert_cli_error(&output);
+    let message = assert_cli_error_with_code(&output, 2);
     assert!(
         message.starts_with("cannot audit `does/not/exist`: "),
         "{message}"
@@ -113,6 +145,51 @@ fn audit_of_an_unreadable_directory_fails_instead_of_skipping_it() {
     );
     assert!(
         message.contains("Permission denied") || message.contains("permission denied"),
+        "{message}"
+    );
+}
+
+#[test]
+fn audit_strict_with_an_unparsable_source_exits_2_as_invalid_input() {
+    let output = run_with_stdin(&["audit", "-", "--strict"], "pub fn {{{{{");
+    let message = assert_cli_error_with_code(&output, 2);
+    assert_eq!(
+        message,
+        "1 file(s) failed to parse and were not audited (--strict): <stdin>"
+    );
+}
+
+#[test]
+fn audit_of_an_unparsable_source_is_a_warning_without_strict() {
+    let output = run_with_stdin(&["audit", "-"], "pub fn {{{{{");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains("warning: skipped <stdin>: it failed to parse"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn negative_start_and_step_parse_as_values_not_flags() {
+    // A flag clap does not know exits 2 as a usage error. A parsed value gets
+    // past argument parsing and fails when the missing contract is loaded.
+    let output = run(&[
+        "limits",
+        "--contract",
+        "missing.wasm",
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "recipients",
+        "--start",
+        "-5",
+        "--step",
+        "-2",
+    ]);
+    let message = assert_cli_error(&output);
+    assert!(
+        message.starts_with("failed to read `missing.wasm`: "),
         "{message}"
     );
 }

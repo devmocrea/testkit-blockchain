@@ -21,7 +21,7 @@ Options:
 EXIT STATUS:
     0  success
     1  the command failed; the reason is printed on stderr as `error: ...`
-    2  invalid usage (unknown flag, missing argument, ...)
+    2  invalid usage (unknown flag, missing argument, ...) or invalid audit input
 
 ENVIRONMENT:
     NO_COLOR  a non-empty value has the same effect as --no-color

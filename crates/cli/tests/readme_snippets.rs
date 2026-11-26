@@ -365,17 +365,18 @@ fn readme_coverage_dry_run_snippets_need_no_toolchain_or_network() {
 
 #[test]
 fn readme_failure_examples_match_the_shared_error_conventions() {
-    // README "Failure examples" documents exit status 1 plus a single
-    // `error: <message>` line on stderr. Reproduce two of them network-free
-    // and assert the exact prefixes the README shows, so the docs cannot
-    // drift from `CliError`'s conventions. (The `limits` unknown-parameter
-    // and `coverage` llvm-cov-missing shapes are covered by
-    // `error_output.rs` and `coverage` unit tests against the same strings.)
+    // README "Failure examples" documents a single `error: <message>` line on
+    // stderr, with exit status 1, or 2 for `audit` invalid input. Reproduce
+    // two of them network-free and assert the exact prefixes the README
+    // shows, so the docs cannot drift from `CliError`'s conventions. (The
+    // `limits` unknown-parameter and `coverage` llvm-cov-missing shapes are
+    // covered by `error_output.rs` and `coverage` unit tests against the same
+    // strings.)
 
-    // `soroban-testkit audit ./scr` — PATH doesn't exist.
+    // `soroban-testkit audit ./scr` — PATH doesn't exist (invalid input, exit 2).
     let output = run(&["audit", "./scr"]);
     let err = stderr(&output);
-    assert_eq!(output.status.code(), Some(1), "stderr: {err}");
+    assert_eq!(output.status.code(), Some(2), "stderr: {err}");
     assert!(
         err.starts_with("error: cannot audit `./scr`: "),
         "README failure shape drifted: {err}"

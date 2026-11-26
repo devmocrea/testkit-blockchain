@@ -10,8 +10,8 @@ Arguments:
 Options:
       --no-color             Never emit ANSI color codes, here or from tools this command runs
                              (e.g. cargo). Same as setting the `NO_COLOR` environment variable
-      --strict               Exit 1 if any findings are reported. Without it, findings are
-                             printed and the command still exits 0
+      --strict               Exit 1 if any findings are reported, or 2 if a file failed to parse.
+                             Without it, findings are printed and the command still exits 0
       --json                 Print findings as a JSON document (`schema_version` 1) on stdout
                              instead of text
   -q, --quiet                Print only results and errors; suppress advisory notes. Cannot be
