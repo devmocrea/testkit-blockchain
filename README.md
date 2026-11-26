@@ -483,6 +483,13 @@ claims about live-network behavior.
   `max_entry_ttl` and advances the whole ledger beyond it; `kind` documents the
   caller's intent but does not restrict expiry to one entry or storage kind.
   Use a disposable `TestEnv` when unrelated state must survive.
+- `assert_survives_expiry` passes as long as the closure does not panic. When
+  the closure returns a `Result`, use `assert_survives_expiry_result` instead:
+  it fails on a returned `Err` (shown through `Debug`) as well as on a panic,
+  and hands back the `Ok` value on success. On failure both assertions quote
+  the panic payload, so the message says *why* the contract did not survive: a
+  string payload is shown verbatim and a payload carrying an SDK error keeps
+  its contract error code (for example `Error(Contract, #1)`).
 
 #### Expiry versus archival
 
