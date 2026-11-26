@@ -8,12 +8,22 @@ use soroban_sdk::{Address, Env, Error, IntoVal, InvokeError};
 
 use crate::core::{TestEnv, TestkitError};
 
-/// The decimal precision every Stellar Asset Contract uses. This is fixed
-/// by the protocol (the classic Stellar asset precision), not something a
-/// deployer can choose — verified against soroban-sdk 27.0.6:
+/// The decimal precision every Stellar Asset Contract uses.
+///
+/// This is fixed by the protocol (the classic Stellar asset precision), not
+/// something a deployer can choose. Verified against soroban-sdk 27.0.6:
 /// `register_stellar_asset_contract_v2` takes no decimals parameter, and a
 /// freshly deployed SAC's own `decimals()` always returns 7.
-const SAC_DECIMALS: u32 = 7;
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::prelude::*;
+///
+/// let env = TestEnv::new();
+/// assert_eq!(env.token().decimals(), SAC_DECIMALS);
+/// ```
+pub const SAC_DECIMALS: u32 = 7;
 
 /// SAC `ContractError::BalanceError` code, returned when a transfer would
 /// take the sender's balance below zero.
@@ -43,6 +53,7 @@ pub struct TestToken {
     admin: Address,
     total_tracked: Cell<i128>,
 }
+
 impl TestToken {
     fn new(env: &Env, admin: Address) -> Self {
         let sac = env.register_stellar_asset_contract_v2(admin.clone());
@@ -52,6 +63,19 @@ impl TestToken {
             admin,
             total_tracked: Cell::new(0),
         }
+    }
+
+    /// The admin address this token was registered with.
+    ///
+    /// Use this when composing auth expectations, e.g. for `mint`,
+    /// `set_authorized`, or `set_admin`, which require the admin's auth.
+    pub fn admin(&self) -> &Address {
+        &self.admin
+    }
+
+    /// The admin address as an owned value, for APIs that take `Address` by value.
+    pub fn admin_address(&self) -> Address {
+        self.admin.clone()
     }
 
     /// The token contract's address.
@@ -152,16 +176,20 @@ impl TestToken {
         // Work out the new tracked total first, so an overflow is reported
         // before anything is minted and the token and the tracker never
         // disagree.
-        let new_total = self.total_tracked.get().checked_add(amount).unwrap_or_else(|| {
-            panic!(
-                "{}",
-                TestkitError::Misuse(format!(
+        let new_total = self
+            .total_tracked
+            .get()
+            .checked_add(amount)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}",
+                    TestkitError::Misuse(format!(
                     "mint_raw({amount}) would overflow total_tracked (currently {}); the sum of \
                      all mints must stay within i128::MAX",
                     self.total_tracked.get()
                 ))
-            )
-        });
+                )
+            });
         StellarAssetClient::new(&self.env, &self.address)
             .mock_auths(&[MockAuth {
                 address: &self.admin,
@@ -185,8 +213,9 @@ impl TestToken {
     ///
     /// # Panics
     ///
-    /// Panics with a [`TestkitError::AssertionFailed`] showing the expected
-    /// and actual balances if they differ.
+    /// Panics with a [`TestkitError::AssertionFailed`] showing the token
+    /// address, recipient address, and expected and actual balances if they
+    /// differ.
     ///
     /// # Example
     ///
@@ -206,7 +235,8 @@ impl TestToken {
             panic!(
                 "{}",
                 TestkitError::AssertionFailed(format!(
-                    "expected balance of {of:?} to be {expected}, found {actual}"
+                    "expected balance of {of:?} on token {:?} to be {expected}, found {actual}",
+                    self.address
                 ))
             );
         }
@@ -760,5 +790,32 @@ mod tests {
         wallet.allow(&token.address(), &alice, &spender, &50, &1_000);
         let allowance = TokenClient::new(env.env(), &token.address()).allowance(&alice, &spender);
         assert_eq!(allowance, 50);
+    }
+
+    #[test]
+    fn assert_balance_failure_includes_token_and_recipient_context() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        token.mint_raw(&alice, 42);
+
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            token.assert_balance(&alice, 100);
+        }))
+        .expect_err("expected assert_balance to panic on mismatch");
+
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .expect("panic payload should be a string");
+
+        assert_eq!(
+            msg,
+            format!(
+                "assertion failed: expected balance of {alice:?} on token {:?} to be 100, found 42",
+                token.address()
+            )
+        );
     }
 }

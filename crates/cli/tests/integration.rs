@@ -927,3 +927,26 @@ impl Vault {
         "{stdout}"
     );
 }
+
+#[test]
+fn audit_qualified_and_aliased_address_fixture() {
+    let output = run_cli(&[
+        "audit",
+        "crates/cli/tests/fixtures/audit/qualified_address.rs",
+        "--json",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert_eq!(
+        audit_json_findings(&stdout),
+        vec![
+            (13, "missing-require-auth".to_string()),
+            (14, "missing-require-auth".to_string()),
+            (15, "missing-require-auth".to_string()),
+            (16, "missing-require-auth".to_string()),
+            (17, "missing-require-auth".to_string()),
+            (18, "missing-require-auth".to_string()),
+        ],
+        "{stdout}"
+    );
+}

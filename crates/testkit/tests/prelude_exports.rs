@@ -34,8 +34,9 @@ fn prelude_exports_every_documented_primary_type() {
     let _: Vec<u32> = bps_values();
     let _: Option<Conservation> = None;
 
-    // tokens::TestToken
+    // tokens::{TestToken, SAC_DECIMALS}
     let _token: TestToken = env.token();
+    assert_eq!(_token.decimals(), SAC_DECIMALS);
 
     // ttl::StorageKind
     let _kind = StorageKind::Persistent;
